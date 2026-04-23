@@ -417,3 +417,79 @@ void maxpool_v3(const half* input, half* output, const PoolParams& params, cudaS
     maxpool_v3_kernel<half, BLOCK><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ============================================================================
+// MaxPool2d v4: warp-level reduce kernel
+// Each warp (32 threads) cooperatively handles one output position (n, oh, ow, c).
+// The karea = kh*kw elements of the kernel window are distributed across the 32
+// lanes of the warp. Each lane processes its subset (serial loop within lane),
+// then a warp shuffle reduction computes the final max.
+// For large kernels (karea > 32), each lane handles multiple elements.
+// For small kernels (karea < 32), idle lanes contribute -INFINITY (max identity).
+// ============================================================================
+
+template <typename T>
+__global__ void maxpool_v4_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const PoolParams params)
+{
+    const int64_t n = blockIdx.z;
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int64_t flat = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + warp_id;
+    const int64_t OHW_C = params.OH * params.OW * params.C;
+    if (n >= params.N || flat >= OHW_C) return;
+
+    const int64_t oh = flat / (params.OW * params.C);
+    const int64_t ow = (flat / params.C) % params.OW;
+    const int64_t c  = flat % params.C;
+
+    const int karea = params.kh * params.kw;
+    float myval = -INFINITY;
+
+    // Each lane handles its subset of kernel positions
+    for (int ki = lane; ki < karea; ki += 32) {
+        const int kh_idx = ki / params.kw;
+        const int kw_idx = ki % params.kw;
+        const int64_t ih = oh * params.sh - params.ph + static_cast<int64_t>(kh_idx) * params.dh;
+        const int64_t iw = ow * params.sw - params.pw + static_cast<int64_t>(kw_idx) * params.dw;
+        if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+            const int64_t in_idx = ((n * params.H + ih) * params.W + iw) * params.C + c;
+            float val = static_cast<float>(input[in_idx]);
+            if (val > myval) myval = val;
+        }
+    }
+
+    // Warp-level max reduction using __shfl_down_sync
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_down_sync(0xFFFFFFFF, myval, offset);
+        if (other > myval) myval = other;
+    }
+
+    // Lane 0 writes the result
+    if (lane == 0) {
+        const int64_t out_idx = ((n * params.OH + oh) * params.OW + ow) * params.C + c;
+        output[out_idx] = static_cast<T>(myval);
+    }
+}
+
+void maxpool_v4(const float* input, float* output, const PoolParams& params, cudaStream_t stream) {
+    const int64_t total = params.OH * params.OW * params.C;
+    const int threads = 256;
+    const int warps_per_block = threads / 32;  // 8
+    const int blocks_x = static_cast<int>((total + warps_per_block - 1) / warps_per_block);
+    dim3 grid(blocks_x, 1, static_cast<int>(params.N));
+    maxpool_v4_kernel<float><<<grid, threads, 0, stream>>>(input, output, params);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void maxpool_v4(const half* input, half* output, const PoolParams& params, cudaStream_t stream) {
+    const int64_t total = params.OH * params.OW * params.C;
+    const int threads = 256;
+    const int warps_per_block = threads / 32;  // 8
+    const int blocks_x = static_cast<int>((total + warps_per_block - 1) / warps_per_block);
+    dim3 grid(blocks_x, 1, static_cast<int>(params.N));
+    maxpool_v4_kernel<half><<<grid, threads, 0, stream>>>(input, output, params);
+    CUDA_CHECK(cudaGetLastError());
+}

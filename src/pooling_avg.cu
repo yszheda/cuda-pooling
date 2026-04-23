@@ -528,3 +528,105 @@ void avgpool_v3(const half* input, half* output, const AvgPoolParams& params, cu
     avgpool_v3_kernel<half, BLOCK><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ============================================================================
+// AvgPool2d v4: warp-level reduce kernel
+// Each warp (32 threads) cooperatively handles one output position (n, oh, ow, c).
+// The karea = kh*kw elements of the kernel window are distributed across the 32
+// lanes of the warp. Each lane accumulates a local sum and count, then warp
+// shuffle reductions compute the final sum and count.
+// For large kernels (karea > 32), each lane handles multiple elements.
+// For small kernels (karea < 32), idle lanes contribute 0 (sum/count identity).
+// ============================================================================
+
+template <typename T>
+__global__ void avgpool_v4_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const AvgPoolParams params)
+{
+    const int64_t n = blockIdx.z;
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int64_t flat = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + warp_id;
+    const int64_t OHW_C = params.OH * params.OW * params.C;
+    if (n >= params.N || flat >= OHW_C) return;
+
+    const int64_t oh = flat / (params.OW * params.C);
+    const int64_t ow = (flat / params.C) % params.OW;
+    const int64_t c  = flat % params.C;
+
+    const int karea = params.kh * params.kw;
+    float mysum = 0.0f;
+    int mycount = 0;
+
+    // Each lane handles its subset of kernel positions
+    for (int ki = lane; ki < karea; ki += 32) {
+        const int kh_idx = ki / params.kw;
+        const int kw_idx = ki % params.kw;
+        const int64_t ih = oh * params.sh - params.ph + static_cast<int64_t>(kh_idx) * params.dh;
+        const int64_t iw = ow * params.sw - params.pw + static_cast<int64_t>(kw_idx) * params.dw;
+
+        const bool ih_in = (ih >= 0 && ih < params.H);
+        const bool iw_in = (iw >= 0 && iw < params.W);
+
+        if (ih_in && iw_in) {
+            const int64_t in_idx = ((n * params.H + ih) * params.W + iw) * params.C + c;
+            mysum += static_cast<float>(input[in_idx]);
+            mycount++;
+        } else if (params.count_include_pad) {
+            const bool ih_in_pad = (ih >= -static_cast<int64_t>(params.ph) &&
+                                    ih < params.H + static_cast<int64_t>(params.ph));
+            const bool iw_in_pad = (iw >= -static_cast<int64_t>(params.pw) &&
+                                    iw < params.W + static_cast<int64_t>(params.pw));
+            if (ih_in_pad && iw_in_pad) {
+                mycount++;
+            }
+        }
+    }
+
+    // Warp-level sum reduction
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        mysum += __shfl_down_sync(0xFFFFFFFF, mysum, offset);
+    }
+
+    // Warp-level count reduction using float shuffle and casting
+    float mycount_f = static_cast<float>(mycount);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        mycount_f += __shfl_down_sync(0xFFFFFFFF, mycount_f, offset);
+    }
+
+    // Lane 0 computes the average and writes the result
+    if (lane == 0) {
+        const int total_count = static_cast<int>(mycount_f);
+        float divisor;
+        if (params.divisor_override > 0) {
+            divisor = static_cast<float>(params.divisor_override);
+        } else {
+            divisor = static_cast<float>(total_count);
+        }
+
+        const int64_t out_idx = ((n * params.OH + oh) * params.OW + ow) * params.C + c;
+        output[out_idx] = static_cast<T>((divisor > 0.0f) ? (mysum / divisor) : 0.0f);
+    }
+}
+
+void avgpool_v4(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    const int64_t total = params.OH * params.OW * params.C;
+    const int threads = 256;
+    const int warps_per_block = threads / 32;  // 8
+    const int blocks_x = static_cast<int>((total + warps_per_block - 1) / warps_per_block);
+    dim3 grid(blocks_x, 1, static_cast<int>(params.N));
+    avgpool_v4_kernel<float><<<grid, threads, 0, stream>>>(input, output, params);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void avgpool_v4(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    const int64_t total = params.OH * params.OW * params.C;
+    const int threads = 256;
+    const int warps_per_block = threads / 32;  // 8
+    const int blocks_x = static_cast<int>((total + warps_per_block - 1) / warps_per_block);
+    dim3 grid(blocks_x, 1, static_cast<int>(params.N));
+    avgpool_v4_kernel<half><<<grid, threads, 0, stream>>>(input, output, params);
+    CUDA_CHECK(cudaGetLastError());
+}
