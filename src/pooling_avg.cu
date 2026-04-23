@@ -630,3 +630,398 @@ void avgpool_v4(const half* input, half* output, const AvgPoolParams& params, cu
     avgpool_v4_kernel<half><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ============================================================================
+// AvgPool2d v5: double buffer / pipeline kernel
+// Each block handles 2 consecutive channels (c and c+1), using double-buffered
+// shared memory. The block loads channel c's tile into buf[0], computes the avg,
+// then loads channel c+1's tile into buf[1] while the warp scheduler can
+// interleave memory and compute from different warps (implicit overlap).
+// Double-buffering reduces the grid dimension by half (ceil(C/2) channel-pairs
+// instead of C channels) and keeps both tiles resident in smem.
+// If C is odd, the last channel pair only uses buf[0].
+// Falls back to v1 if C < 2 or smem is too large.
+// ============================================================================
+
+template <int TILE_OH = 8, int TILE_OW = 8>
+__global__ void avgpool_v5_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    const AvgPoolParams params,
+    int blocks_oh, int blocks_ow,
+    int smem_h, int smem_w)
+{
+    extern __shared__ float sdata[];
+    float* buf[2] = { sdata, sdata + smem_h * smem_w };
+
+    const int n = blockIdx.z;
+    const int c_pair = blockIdx.y;
+    const int c0 = c_pair * 2;
+    const int c1 = c0 + 1;
+    const bool has_c1 = (c1 < params.C);
+
+    const int tile_idx = blockIdx.x;
+    const int tile_oh = tile_idx / blocks_ow;
+    const int tile_ow = tile_idx % blocks_ow;
+
+    const int th = threadIdx.y;
+    const int tw = threadIdx.x;
+
+    const int oh = tile_oh * TILE_OH + th;
+    const int ow = tile_ow * TILE_OW + tw;
+
+    const int ih_start = tile_oh * TILE_OH * params.sh - params.ph;
+    const int iw_start = tile_ow * TILE_OW * params.sw - params.pw;
+
+    const int total_smem = smem_h * smem_w;
+    const int tid = th * TILE_OW + tw;
+    const int nthreads = TILE_OH * TILE_OW;
+
+    // Phase 1: Load channel c0 into buf[0]
+    for (int i = tid; i < total_smem; i += nthreads) {
+        const int sih = i / smem_w;
+        const int siw = i % smem_w;
+        const int ih = ih_start + sih;
+        const int iw = iw_start + siw;
+        if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+            const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c0;
+            buf[0][i] = input[in_idx];
+        } else {
+            buf[0][i] = 0.0f;  // Padded positions contribute 0 to sum
+        }
+    }
+    __syncthreads();
+
+    // Compute avg from buf[0] for channel c0
+    float sum_c0 = 0.0f;
+    int count_c0 = 0;
+    if (oh < params.OH && ow < params.OW) {
+        for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+            const int sih = th * params.sh + kh_i * params.dh;
+            if (sih >= smem_h) continue;
+            const int64_t ih = static_cast<int64_t>(ih_start) + sih;
+            for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+                const int siw = tw * params.sw + kw_i * params.dw;
+                if (siw >= smem_w) continue;
+                const int64_t iw = static_cast<int64_t>(iw_start) + siw;
+
+                const bool ih_in = (ih >= 0 && ih < params.H);
+                const bool iw_in = (iw >= 0 && iw < params.W);
+
+                if (ih_in && iw_in) {
+                    sum_c0 += buf[0][sih * smem_w + siw];
+                    count_c0++;
+                } else if (params.count_include_pad) {
+                    const bool ih_in_pad = (ih >= -static_cast<int64_t>(params.ph) &&
+                                            ih < params.H + static_cast<int64_t>(params.ph));
+                    const bool iw_in_pad = (iw >= -static_cast<int64_t>(params.pw) &&
+                                            iw < params.W + static_cast<int64_t>(params.pw));
+                    if (ih_in_pad && iw_in_pad) {
+                        count_c0++;
+                    }
+                }
+            }
+        }
+
+        float divisor;
+        if (params.divisor_override > 0) {
+            divisor = static_cast<float>(params.divisor_override);
+        } else {
+            divisor = static_cast<float>(count_c0);
+        }
+        const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c0;
+        output[out_idx] = (divisor > 0.0f) ? (sum_c0 / divisor) : 0.0f;
+    }
+
+    if (has_c1) {
+        // Phase 2: Load channel c1 into buf[1]
+        for (int i = tid; i < total_smem; i += nthreads) {
+            const int sih = i / smem_w;
+            const int siw = i % smem_w;
+            const int ih = ih_start + sih;
+            const int iw = iw_start + siw;
+            if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+                const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c1;
+                buf[1][i] = input[in_idx];
+            } else {
+                buf[1][i] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        // Phase 3: Compute avg from buf[1] for channel c1
+        float sum_c1 = 0.0f;
+        int count_c1 = 0;
+        if (oh < params.OH && ow < params.OW) {
+            for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+                const int sih = th * params.sh + kh_i * params.dh;
+                if (sih >= smem_h) continue;
+                const int64_t ih = static_cast<int64_t>(ih_start) + sih;
+                for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+                    const int siw = tw * params.sw + kw_i * params.dw;
+                    if (siw >= smem_w) continue;
+                    const int64_t iw = static_cast<int64_t>(iw_start) + siw;
+
+                    const bool ih_in = (ih >= 0 && ih < params.H);
+                    const bool iw_in = (iw >= 0 && iw < params.W);
+
+                    if (ih_in && iw_in) {
+                        sum_c1 += buf[1][sih * smem_w + siw];
+                        count_c1++;
+                    } else if (params.count_include_pad) {
+                        const bool ih_in_pad = (ih >= -static_cast<int64_t>(params.ph) &&
+                                                ih < params.H + static_cast<int64_t>(params.ph));
+                        const bool iw_in_pad = (iw >= -static_cast<int64_t>(params.pw) &&
+                                                iw < params.W + static_cast<int64_t>(params.pw));
+                        if (ih_in_pad && iw_in_pad) {
+                            count_c1++;
+                        }
+                    }
+                }
+            }
+
+            float divisor;
+            if (params.divisor_override > 0) {
+                divisor = static_cast<float>(params.divisor_override);
+            } else {
+                divisor = static_cast<float>(count_c1);
+            }
+            const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c1;
+            output[out_idx] = (divisor > 0.0f) ? (sum_c1 / divisor) : 0.0f;
+        }
+    }
+}
+
+// half specialization: synchronous cooperative load with double-buffered smem
+template <int TILE_OH = 8, int TILE_OW = 8>
+__global__ void avgpool_v5_kernel_half(
+    const half* __restrict__ input,
+    half* __restrict__ output,
+    const AvgPoolParams params,
+    int blocks_oh, int blocks_ow,
+    int smem_h, int smem_w)
+{
+    extern __shared__ float sdata[];
+    float* buf[2] = { sdata, sdata + smem_h * smem_w };
+
+    const int n = blockIdx.z;
+    const int c_pair = blockIdx.y;
+    const int c0 = c_pair * 2;
+    const int c1 = c0 + 1;
+    const bool has_c1 = (c1 < params.C);
+
+    const int tile_idx = blockIdx.x;
+    const int tile_oh = tile_idx / blocks_ow;
+    const int tile_ow = tile_idx % blocks_ow;
+
+    const int th = threadIdx.y;
+    const int tw = threadIdx.x;
+
+    const int oh = tile_oh * TILE_OH + th;
+    const int ow = tile_ow * TILE_OW + tw;
+
+    const int ih_start = tile_oh * TILE_OH * params.sh - params.ph;
+    const int iw_start = tile_ow * TILE_OW * params.sw - params.pw;
+
+    const int total_smem = smem_h * smem_w;
+    const int tid = th * TILE_OW + tw;
+    const int nthreads = TILE_OH * TILE_OW;
+
+    // Phase 1: Synchronously load channel c0 into buf[0]
+    for (int i = tid; i < total_smem; i += nthreads) {
+        const int sih = i / smem_w;
+        const int siw = i % smem_w;
+        const int ih = ih_start + sih;
+        const int iw = iw_start + siw;
+        if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+            const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c0;
+            buf[0][i] = static_cast<float>(input[in_idx]);
+        } else {
+            buf[0][i] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // Compute avg from buf[0] for channel c0
+    float sum_c0 = 0.0f;
+    int count_c0 = 0;
+    if (oh < params.OH && ow < params.OW) {
+        for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+            const int sih = th * params.sh + kh_i * params.dh;
+            if (sih >= smem_h) continue;
+            const int64_t ih = static_cast<int64_t>(ih_start) + sih;
+            for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+                const int siw = tw * params.sw + kw_i * params.dw;
+                if (siw >= smem_w) continue;
+                const int64_t iw = static_cast<int64_t>(iw_start) + siw;
+
+                const bool ih_in = (ih >= 0 && ih < params.H);
+                const bool iw_in = (iw >= 0 && iw < params.W);
+
+                if (ih_in && iw_in) {
+                    sum_c0 += buf[0][sih * smem_w + siw];
+                    count_c0++;
+                } else if (params.count_include_pad) {
+                    const bool ih_in_pad = (ih >= -static_cast<int64_t>(params.ph) &&
+                                            ih < params.H + static_cast<int64_t>(params.ph));
+                    const bool iw_in_pad = (iw >= -static_cast<int64_t>(params.pw) &&
+                                            iw < params.W + static_cast<int64_t>(params.pw));
+                    if (ih_in_pad && iw_in_pad) {
+                        count_c0++;
+                    }
+                }
+            }
+        }
+
+        float divisor;
+        if (params.divisor_override > 0) {
+            divisor = static_cast<float>(params.divisor_override);
+        } else {
+            divisor = static_cast<float>(count_c0);
+        }
+        const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c0;
+        output[out_idx] = static_cast<half>((divisor > 0.0f) ? (sum_c0 / divisor) : 0.0f);
+    }
+
+    if (has_c1) {
+        // Phase 2: Load channel c1 into buf[1] (synchronous for half)
+        for (int i = tid; i < total_smem; i += nthreads) {
+            const int sih = i / smem_w;
+            const int siw = i % smem_w;
+            const int ih = ih_start + sih;
+            const int iw = iw_start + siw;
+            if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+                const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c1;
+                buf[1][i] = static_cast<float>(input[in_idx]);
+            } else {
+                buf[1][i] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        // Phase 3: Compute avg from buf[1] for channel c1
+        float sum_c1 = 0.0f;
+        int count_c1 = 0;
+        if (oh < params.OH && ow < params.OW) {
+            for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+                const int sih = th * params.sh + kh_i * params.dh;
+                if (sih >= smem_h) continue;
+                const int64_t ih = static_cast<int64_t>(ih_start) + sih;
+                for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+                    const int siw = tw * params.sw + kw_i * params.dw;
+                    if (siw >= smem_w) continue;
+                    const int64_t iw = static_cast<int64_t>(iw_start) + siw;
+
+                    const bool ih_in = (ih >= 0 && ih < params.H);
+                    const bool iw_in = (iw >= 0 && iw < params.W);
+
+                    if (ih_in && iw_in) {
+                        sum_c1 += buf[1][sih * smem_w + siw];
+                        count_c1++;
+                    } else if (params.count_include_pad) {
+                        const bool ih_in_pad = (ih >= -static_cast<int64_t>(params.ph) &&
+                                                ih < params.H + static_cast<int64_t>(params.ph));
+                        const bool iw_in_pad = (iw >= -static_cast<int64_t>(params.pw) &&
+                                                iw < params.W + static_cast<int64_t>(params.pw));
+                        if (ih_in_pad && iw_in_pad) {
+                            count_c1++;
+                        }
+                    }
+                }
+            }
+
+            float divisor;
+            if (params.divisor_override > 0) {
+                divisor = static_cast<float>(params.divisor_override);
+            } else {
+                divisor = static_cast<float>(count_c1);
+            }
+            const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c1;
+            output[out_idx] = static_cast<half>((divisor > 0.0f) ? (sum_c1 / divisor) : 0.0f);
+        }
+    }
+}
+
+void avgpool_v5(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    constexpr int TILE_OH = 8;
+    constexpr int TILE_OW = 8;
+
+    if (params.C < 2) {
+        avgpool_v1(input, output, params, stream);
+        return;
+    }
+
+    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
+    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
+
+    int smem_h = (TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1;
+    int smem_w = (TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1;
+    smem_h = min(smem_h, static_cast<int>(params.H + 2 * params.ph));
+    smem_w = min(smem_w, static_cast<int>(params.W + 2 * params.pw));
+
+    size_t smem_bytes = 2 * static_cast<size_t>(smem_h) * smem_w * sizeof(float);
+
+    int smem_limit = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+    if (smem_bytes > static_cast<size_t>(smem_limit)) {
+        avgpool_v1(input, output, params, stream);
+        return;
+    }
+
+    const int c_pairs = static_cast<int>((params.C + 1) / 2);
+    dim3 block(TILE_OW, TILE_OH);
+    dim3 grid(blocks_oh * blocks_ow, c_pairs, static_cast<int>(params.N));
+
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            avgpool_v5_kernel<TILE_OH, TILE_OW>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem_bytes)));
+    }
+
+    avgpool_v5_kernel<TILE_OH, TILE_OW><<<grid, block, smem_bytes, stream>>>(
+        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void avgpool_v5(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    constexpr int TILE_OH = 8;
+    constexpr int TILE_OW = 8;
+
+    if (params.C < 2) {
+        avgpool_v1(input, output, params, stream);
+        return;
+    }
+
+    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
+    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
+
+    int smem_h = (TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1;
+    int smem_w = (TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1;
+    smem_h = min(smem_h, static_cast<int>(params.H + 2 * params.ph));
+    smem_w = min(smem_w, static_cast<int>(params.W + 2 * params.pw));
+
+    size_t smem_bytes = 2 * static_cast<size_t>(smem_h) * smem_w * sizeof(float);
+
+    int smem_limit = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+    if (smem_bytes > static_cast<size_t>(smem_limit)) {
+        avgpool_v1(input, output, params, stream);
+        return;
+    }
+
+    const int c_pairs = static_cast<int>((params.C + 1) / 2);
+    dim3 block(TILE_OW, TILE_OH);
+    dim3 grid(blocks_oh * blocks_ow, c_pairs, static_cast<int>(params.N));
+
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            avgpool_v5_kernel_half<TILE_OH, TILE_OW>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem_bytes)));
+    }
+
+    avgpool_v5_kernel_half<TILE_OH, TILE_OW><<<grid, block, smem_bytes, stream>>>(
+        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
+    CUDA_CHECK(cudaGetLastError());
+}

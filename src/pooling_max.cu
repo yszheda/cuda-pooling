@@ -493,3 +493,312 @@ void maxpool_v4(const half* input, half* output, const PoolParams& params, cudaS
     maxpool_v4_kernel<half><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ============================================================================
+// MaxPool2d v5: double buffer / pipeline kernel
+// Each block handles 2 consecutive channels (c and c+1), using double-buffered
+// shared memory. The block loads channel c's tile into buf[0], computes the max,
+// then loads channel c+1's tile into buf[1] while the warp scheduler can
+// interleave memory and compute from different warps (implicit overlap).
+// Double-buffering reduces the grid dimension by half (ceil(C/2) channel-pairs
+// instead of C channels) and keeps both tiles resident in smem.
+// If C is odd, the last channel pair only uses buf[0].
+// Falls back to v1 if C < 2 or smem is too large.
+// ============================================================================
+
+template <int TILE_OH = 8, int TILE_OW = 8>
+__global__ void maxpool_v5_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    const PoolParams params,
+    int blocks_oh, int blocks_ow,
+    int smem_h, int smem_w)
+{
+    extern __shared__ float sdata[];
+    float* buf[2] = { sdata, sdata + smem_h * smem_w };
+
+    const int n = blockIdx.z;
+    const int c_pair = blockIdx.y;
+    const int c0 = c_pair * 2;
+    const int c1 = c0 + 1;
+    const bool has_c1 = (c1 < params.C);
+
+    const int tile_idx = blockIdx.x;
+    const int tile_oh = tile_idx / blocks_ow;
+    const int tile_ow = tile_idx % blocks_ow;
+
+    const int th = threadIdx.y;
+    const int tw = threadIdx.x;
+
+    const int oh = tile_oh * TILE_OH + th;
+    const int ow = tile_ow * TILE_OW + tw;
+
+    const int ih_start = tile_oh * TILE_OH * params.sh - params.ph;
+    const int iw_start = tile_ow * TILE_OW * params.sw - params.pw;
+
+    const int total_smem = smem_h * smem_w;
+    const int tid = th * TILE_OW + tw;
+    const int nthreads = TILE_OH * TILE_OW;
+
+    // Phase 1: Load channel c0 into buf[0]
+    for (int i = tid; i < total_smem; i += nthreads) {
+        const int sih = i / smem_w;
+        const int siw = i % smem_w;
+        const int ih = ih_start + sih;
+        const int iw = iw_start + siw;
+        if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+            const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c0;
+            buf[0][i] = input[in_idx];
+        } else {
+            buf[0][i] = -INFINITY;
+        }
+    }
+    __syncthreads();
+
+    // Compute max from buf[0] for channel c0
+    float maxval_c0 = -INFINITY;
+    if (oh < params.OH && ow < params.OW) {
+        for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+            const int sih = th * params.sh + kh_i * params.dh;
+            if (sih >= smem_h) continue;
+            for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+                const int siw = tw * params.sw + kw_i * params.dw;
+                if (siw >= smem_w) continue;
+                const float val = buf[0][sih * smem_w + siw];
+                if (val > maxval_c0) maxval_c0 = val;
+            }
+        }
+    }
+
+    // Write output for channel c0
+    if (oh < params.OH && ow < params.OW) {
+        const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c0;
+        output[out_idx] = maxval_c0;
+    }
+
+    if (has_c1) {
+        // Phase 2: Load channel c1 into buf[1]
+        for (int i = tid; i < total_smem; i += nthreads) {
+            const int sih = i / smem_w;
+            const int siw = i % smem_w;
+            const int ih = ih_start + sih;
+            const int iw = iw_start + siw;
+            if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+                const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c1;
+                buf[1][i] = input[in_idx];
+            } else {
+                buf[1][i] = -INFINITY;
+            }
+        }
+        __syncthreads();
+
+        // Phase 3: Compute max from buf[1] for channel c1
+        float maxval_c1 = -INFINITY;
+        if (oh < params.OH && ow < params.OW) {
+            for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+                const int sih = th * params.sh + kh_i * params.dh;
+                if (sih >= smem_h) continue;
+                for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+                    const int siw = tw * params.sw + kw_i * params.dw;
+                    if (siw >= smem_w) continue;
+                    const float val = buf[1][sih * smem_w + siw];
+                    if (val > maxval_c1) maxval_c1 = val;
+                }
+            }
+
+            const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c1;
+            output[out_idx] = maxval_c1;
+        }
+    }
+}
+
+// half specialization
+template <int TILE_OH = 8, int TILE_OW = 8>
+__global__ void maxpool_v5_kernel_half(
+    const half* __restrict__ input,
+    half* __restrict__ output,
+    const PoolParams params,
+    int blocks_oh, int blocks_ow,
+    int smem_h, int smem_w)
+{
+    extern __shared__ float sdata[];
+    float* buf[2] = { sdata, sdata + smem_h * smem_w };
+
+    const int n = blockIdx.z;
+    const int c_pair = blockIdx.y;
+    const int c0 = c_pair * 2;
+    const int c1 = c0 + 1;
+    const bool has_c1 = (c1 < params.C);
+
+    const int tile_idx = blockIdx.x;
+    const int tile_oh = tile_idx / blocks_ow;
+    const int tile_ow = tile_idx % blocks_ow;
+
+    const int th = threadIdx.y;
+    const int tw = threadIdx.x;
+
+    const int oh = tile_oh * TILE_OH + th;
+    const int ow = tile_ow * TILE_OW + tw;
+
+    const int ih_start = tile_oh * TILE_OH * params.sh - params.ph;
+    const int iw_start = tile_ow * TILE_OW * params.sw - params.pw;
+
+    const int total_smem = smem_h * smem_w;
+    const int tid = th * TILE_OW + tw;
+    const int nthreads = TILE_OH * TILE_OW;
+
+    // Phase 1: Load channel c0 into buf[0]
+    for (int i = tid; i < total_smem; i += nthreads) {
+        const int sih = i / smem_w;
+        const int siw = i % smem_w;
+        const int ih = ih_start + sih;
+        const int iw = iw_start + siw;
+        if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+            const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c0;
+            buf[0][i] = static_cast<float>(input[in_idx]);
+        } else {
+            buf[0][i] = -INFINITY;
+        }
+    }
+    __syncthreads();
+
+    // Compute max from buf[0] for channel c0
+    float maxval_c0 = -INFINITY;
+    if (oh < params.OH && ow < params.OW) {
+        for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+            const int sih = th * params.sh + kh_i * params.dh;
+            if (sih >= smem_h) continue;
+            for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+                const int siw = tw * params.sw + kw_i * params.dw;
+                if (siw >= smem_w) continue;
+                const float val = buf[0][sih * smem_w + siw];
+                if (val > maxval_c0) maxval_c0 = val;
+            }
+        }
+    }
+
+    // Write output for channel c0
+    if (oh < params.OH && ow < params.OW) {
+        const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c0;
+        output[out_idx] = static_cast<half>(maxval_c0);
+    }
+
+    if (has_c1) {
+        // Phase 2: Load channel c1 into buf[1]
+        for (int i = tid; i < total_smem; i += nthreads) {
+            const int sih = i / smem_w;
+            const int siw = i % smem_w;
+            const int ih = ih_start + sih;
+            const int iw = iw_start + siw;
+            if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+                const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c1;
+                buf[1][i] = static_cast<float>(input[in_idx]);
+            } else {
+                buf[1][i] = -INFINITY;
+            }
+        }
+        __syncthreads();
+
+        // Phase 3: Compute max from buf[1] for channel c1
+        float maxval_c1 = -INFINITY;
+        if (oh < params.OH && ow < params.OW) {
+            for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+                const int sih = th * params.sh + kh_i * params.dh;
+                if (sih >= smem_h) continue;
+                for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+                    const int siw = tw * params.sw + kw_i * params.dw;
+                    if (siw >= smem_w) continue;
+                    const float val = buf[1][sih * smem_w + siw];
+                    if (val > maxval_c1) maxval_c1 = val;
+                }
+            }
+
+            const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c1;
+            output[out_idx] = static_cast<half>(maxval_c1);
+        }
+    }
+}
+
+void maxpool_v5(const float* input, float* output, const PoolParams& params, cudaStream_t stream) {
+    constexpr int TILE_OH = 8;
+    constexpr int TILE_OW = 8;
+
+    if (params.C < 2) {
+        maxpool_v1(input, output, params, stream);
+        return;
+    }
+
+    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
+    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
+
+    int smem_h = (TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1;
+    int smem_w = (TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1;
+    smem_h = min(smem_h, static_cast<int>(params.H + 2 * params.ph));
+    smem_w = min(smem_w, static_cast<int>(params.W + 2 * params.pw));
+
+    size_t smem_bytes = 2 * static_cast<size_t>(smem_h) * smem_w * sizeof(float);
+
+    int smem_limit = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+    if (smem_bytes > static_cast<size_t>(smem_limit)) {
+        maxpool_v1(input, output, params, stream);
+        return;
+    }
+
+    const int c_pairs = static_cast<int>((params.C + 1) / 2);
+    dim3 block(TILE_OW, TILE_OH);
+    dim3 grid(blocks_oh * blocks_ow, c_pairs, static_cast<int>(params.N));
+
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            maxpool_v5_kernel<TILE_OH, TILE_OW>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem_bytes)));
+    }
+
+    maxpool_v5_kernel<TILE_OH, TILE_OW><<<grid, block, smem_bytes, stream>>>(
+        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void maxpool_v5(const half* input, half* output, const PoolParams& params, cudaStream_t stream) {
+    constexpr int TILE_OH = 8;
+    constexpr int TILE_OW = 8;
+
+    if (params.C < 2) {
+        maxpool_v1(input, output, params, stream);
+        return;
+    }
+
+    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
+    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
+
+    int smem_h = (TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1;
+    int smem_w = (TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1;
+    smem_h = min(smem_h, static_cast<int>(params.H + 2 * params.ph));
+    smem_w = min(smem_w, static_cast<int>(params.W + 2 * params.pw));
+
+    size_t smem_bytes = 2 * static_cast<size_t>(smem_h) * smem_w * sizeof(float);
+
+    int smem_limit = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+    if (smem_bytes > static_cast<size_t>(smem_limit)) {
+        maxpool_v1(input, output, params, stream);
+        return;
+    }
+
+    const int c_pairs = static_cast<int>((params.C + 1) / 2);
+    dim3 block(TILE_OW, TILE_OH);
+    dim3 grid(blocks_oh * blocks_ow, c_pairs, static_cast<int>(params.N));
+
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            maxpool_v5_kernel_half<TILE_OH, TILE_OW>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem_bytes)));
+    }
+
+    maxpool_v5_kernel_half<TILE_OH, TILE_OW><<<grid, block, smem_bytes, stream>>>(
+        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
+    CUDA_CHECK(cudaGetLastError());
+}
