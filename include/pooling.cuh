@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cmath>
+#include <stdexcept>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 

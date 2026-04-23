@@ -23,16 +23,61 @@ static std::pair<int, int> parse_pair(const py::object& obj) {
     throw std::invalid_argument("expected int or tuple(int, int)");
 }
 
-template <typename T>
-py::array_t<T> maxpool2d_impl(
-    py::array_t<T, py::array::c_style | py::array::forcecast> input,
+// Build PoolParams from shape and pooling args
+static PoolParams make_pool_params(
+    const std::vector<py::ssize_t>& shape,
+    int kh, int kw, int sh, int sw, int ph, int pw, int dh, int dw,
+    bool ceil_mode)
+{
+    PoolParams params;
+    params.N = shape[0];
+    params.H = shape[1];
+    params.W = shape[2];
+    params.C = shape[3];
+    params.kh = kh; params.kw = kw;
+    params.sh = sh; params.sw = sw;
+    params.ph = ph; params.pw = pw;
+    params.dh = dh; params.dw = dw;
+    params.ceil_mode = ceil_mode;
+    params.compute_output_size();
+    return params;
+}
+
+// Convert a generic py::array's shape to vector<ssize_t>
+static std::vector<py::ssize_t> array_shape(const py::array& arr) {
+    auto ndim = arr.ndim();
+    std::vector<py::ssize_t> shape(ndim);
+    for (ssize_t i = 0; i < ndim; ++i)
+        shape[i] = arr.shape(i);
+    return shape;
+}
+
+// Ensure array is C-contiguous; return a reference to the original or a copy
+static py::array ensure_c_contiguous(const py::array& arr) {
+    if (arr.flags() & py::array::c_style)
+        return arr;
+    // Make a contiguous copy with same dtype
+    py::module_ np = py::module_::import("numpy");
+    return np.attr("ascontiguousarray")(arr).cast<py::array>();
+}
+
+// Validate that array dtype is float16 (2-byte float)
+static void validate_float16(const py::array& arr) {
+    if (arr.dtype().kind() != 'f' || arr.dtype().itemsize() != 2)
+        throw std::invalid_argument("input must be float16 (numpy float16 / 2-byte float)");
+}
+
+// ==================== MaxPool2d ====================
+
+py::array_t<float> maxpool2d_f32(
+    py::array_t<float, py::array::c_style | py::array::forcecast> input,
     const py::object& kernel_size,
     const py::object& stride,
     const py::object& padding,
     const py::object& dilation,
     bool ceil_mode,
-    int version
-) {
+    int version)
+{
     auto buf = input.request();
     if (buf.ndim != 4)
         throw std::invalid_argument("input must be 4-D [N, H, W, C]");
@@ -42,38 +87,103 @@ py::array_t<T> maxpool2d_impl(
     auto [ph, pw] = parse_pair(padding);
     auto [dh, dw] = parse_pair(dilation);
 
-    PoolParams params;
-    params.N = buf.shape[0];
-    params.H = buf.shape[1];
-    params.W = buf.shape[2];
-    params.C = buf.shape[3];
-    params.kh = kh; params.kw = kw;
-    params.sh = sh; params.sw = sw;
-    params.ph = ph; params.pw = pw;
-    params.dh = dh; params.dw = dw;
-    params.ceil_mode = ceil_mode;
-    params.compute_output_size();
+    auto params = make_pool_params(buf.shape, kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode);
+    size_t in_nelms = buf.size;
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
 
-    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
-    auto output = py::array_t<T>(out_shape);
-    auto out_buf = output.request();
+    // Allocate device buffers and copy input H2D
+    float* d_input = nullptr;
+    float* d_output = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_input, in_nelms * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_output, out_nelms * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_input, buf.ptr, in_nelms * sizeof(float), cudaMemcpyHostToDevice));
 
+    // Launch kernel
     switch (version) {
         case 0:
-            maxpool_v0(static_cast<const T*>(buf.ptr),
-                       static_cast<T*>(out_buf.ptr),
-                       params, 0);
+            maxpool_v0(d_input, d_output, params, 0);
             break;
         default:
+            CUDA_CHECK(cudaFree(d_input));
+            CUDA_CHECK(cudaFree(d_output));
             throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
     }
+
+    // Copy output D2H and free device memory
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    auto output = py::array_t<float>(out_shape);
+    auto out_buf = output.request();
+    CUDA_CHECK(cudaMemcpy(out_buf.ptr, d_output, out_nelms * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_output));
 
     return output;
 }
 
-template <typename T>
-py::array_t<T> avgpool2d_impl(
-    py::array_t<T, py::array::c_style | py::array::forcecast> input,
+// fp16 version: numpy float16 has same memory layout as CUDA half (IEEE 754 binary16).
+// We use py::array (generic) and validate dtype manually, then access raw pointers.
+py::array maxpool2d_f16(
+    py::array input,
+    const py::object& kernel_size,
+    const py::object& stride,
+    const py::object& padding,
+    const py::object& dilation,
+    bool ceil_mode,
+    int version)
+{
+    validate_float16(input);
+    input = ensure_c_contiguous(input);
+
+    if (input.ndim() != 4)
+        throw std::invalid_argument("input must be 4-D [N, H, W, C]");
+
+    auto shape = array_shape(input);
+    size_t in_nbytes = input.size() * sizeof(half);
+
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+
+    auto params = make_pool_params(shape, kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode);
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+    size_t out_nbytes = out_nelms * sizeof(half);
+
+    // Allocate device buffers and copy input H2D
+    half* d_input = nullptr;
+    half* d_output = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_input, in_nbytes));
+    CUDA_CHECK(cudaMalloc(&d_output, out_nbytes));
+    CUDA_CHECK(cudaMemcpy(d_input, input.data(), in_nbytes, cudaMemcpyHostToDevice));
+
+    // Launch kernel
+    switch (version) {
+        case 0:
+            maxpool_v0(d_input, d_output, params, 0);
+            break;
+        default:
+            CUDA_CHECK(cudaFree(d_input));
+            CUDA_CHECK(cudaFree(d_output));
+            throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
+    }
+
+    // Allocate output numpy array with float16 dtype
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    py::module_ np = py::module_::import("numpy");
+    auto output = np.attr("empty")(out_shape, np.attr("float16")).cast<py::array>();
+
+    // Copy output D2H and free device memory
+    CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nbytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_output));
+
+    return output;
+}
+
+// ==================== AvgPool2d (stubs) ====================
+
+py::array_t<float> avgpool2d_f32(
+    py::array_t<float, py::array::c_style | py::array::forcecast> input,
     const py::object& kernel_size,
     const py::object& stride,
     const py::object& padding,
@@ -81,52 +191,29 @@ py::array_t<T> avgpool2d_impl(
     bool ceil_mode,
     bool count_include_pad,
     int64_t divisor_override,
-    int version
-) {
-    auto buf = input.request();
-    if (buf.ndim != 4)
-        throw std::invalid_argument("input must be 4-D [N, H, W, C]");
+    int version)
+{
+    throw std::runtime_error("AvgPool2d not yet implemented");
+}
 
-    auto [kh, kw] = parse_pair(kernel_size);
-    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
-    auto [ph, pw] = parse_pair(padding);
-    auto [dh, dw] = parse_pair(dilation);
-
-    AvgPoolParams params;
-    params.N = buf.shape[0];
-    params.H = buf.shape[1];
-    params.W = buf.shape[2];
-    params.C = buf.shape[3];
-    params.kh = kh; params.kw = kw;
-    params.sh = sh; params.sw = sw;
-    params.ph = ph; params.pw = pw;
-    params.dh = dh; params.dw = dw;
-    params.ceil_mode = ceil_mode;
-    params.count_include_pad = count_include_pad;
-    params.divisor_override = divisor_override;
-    params.compute_output_size();
-
-    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
-    auto output = py::array_t<T>(out_shape);
-    auto out_buf = output.request();
-
-    switch (version) {
-        case 0:
-            avgpool_v0(static_cast<const T*>(buf.ptr),
-                       static_cast<T*>(out_buf.ptr),
-                       params, 0);
-            break;
-        default:
-            throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
-    }
-
-    return output;
+py::array avgpool2d_f16(
+    py::array input,
+    const py::object& kernel_size,
+    const py::object& stride,
+    const py::object& padding,
+    const py::object& dilation,
+    bool ceil_mode,
+    bool count_include_pad,
+    int64_t divisor_override,
+    int version)
+{
+    throw std::runtime_error("AvgPool2d not yet implemented");
 }
 
 PYBIND11_MODULE(_pooling, m) {
     m.doc() = "CUDA Pooling2D kernels";
 
-    m.def("maxpool2d_f32", &maxpool2d_impl<float>,
+    m.def("maxpool2d_f32", &maxpool2d_f32,
           py::arg("input"),
           py::arg("kernel_size"),
           py::arg("stride") = py::none(),
@@ -135,7 +222,7 @@ PYBIND11_MODULE(_pooling, m) {
           py::arg("ceil_mode") = false,
           py::arg("version") = 0);
 
-    m.def("maxpool2d_f16", &maxpool2d_impl<half>,
+    m.def("maxpool2d_f16", &maxpool2d_f16,
           py::arg("input"),
           py::arg("kernel_size"),
           py::arg("stride") = py::none(),
@@ -144,7 +231,7 @@ PYBIND11_MODULE(_pooling, m) {
           py::arg("ceil_mode") = false,
           py::arg("version") = 0);
 
-    m.def("avgpool2d_f32", &avgpool2d_impl<float>,
+    m.def("avgpool2d_f32", &avgpool2d_f32,
           py::arg("input"),
           py::arg("kernel_size"),
           py::arg("stride") = py::none(),
@@ -155,7 +242,7 @@ PYBIND11_MODULE(_pooling, m) {
           py::arg("divisor_override") = 0,
           py::arg("version") = 0);
 
-    m.def("avgpool2d_f16", &avgpool2d_impl<half>,
+    m.def("avgpool2d_f16", &avgpool2d_f16,
           py::arg("input"),
           py::arg("kernel_size"),
           py::arg("stride") = py::none(),
