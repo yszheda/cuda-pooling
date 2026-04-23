@@ -103,6 +103,9 @@ py::array_t<float> maxpool2d_f32(
         case 0:
             maxpool_v0(d_input, d_output, params, 0);
             break;
+        case 1:
+            maxpool_v1(d_input, d_output, params, 0);
+            break;
         default:
             CUDA_CHECK(cudaFree(d_input));
             CUDA_CHECK(cudaFree(d_output));
@@ -160,6 +163,9 @@ py::array maxpool2d_f16(
     switch (version) {
         case 0:
             maxpool_v0(d_input, d_output, params, 0);
+            break;
+        case 1:
+            maxpool_v1(d_input, d_output, params, 0);
             break;
         default:
             CUDA_CHECK(cudaFree(d_input));

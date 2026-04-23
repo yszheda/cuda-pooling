@@ -12,7 +12,7 @@ TOLERANCES = {
     np.float16: 1e-3,
 }
 
-MAXPOOL_VERSIONS = [0]
+MAXPOOL_VERSIONS = [0, 1]
 AVGPOOL_VERSIONS = [0]
 
 
