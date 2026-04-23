@@ -20,12 +20,21 @@ struct PoolParams {
     int64_t OH, OW;
 
     void compute_output_size() {
-        OH = ceil_mode
-            ? (int64_t)ceil((double)(H + 2 * ph - dh * (kh - 1) - 1) / sh + 1)
-            : (int64_t)floor((double)(H + 2 * ph - dh * (kh - 1) - 1) / sh + 1);
-        OW = ceil_mode
-            ? (int64_t)ceil((double)(W + 2 * pw - dw * (kw - 1) - 1) / sw + 1)
-            : (int64_t)floor((double)(W + 2 * pw - dw * (kw - 1) - 1) / sw + 1);
+        if (ceil_mode) {
+            // PyTorch caps ceil_mode output so that each window starts within
+            // the input (not the padding zone): oh*sh - ph < H
+            // => oh < (H + ph) / sh => OH_max = floor((H + ph - 1) / sh) + 1
+            OH = (int64_t)ceil((double)(H + 2 * ph - dh * (kh - 1) - 1) / sh + 1);
+            int64_t OH_cap = (H + ph - 1) / sh + 1;
+            if (OH > OH_cap) OH = OH_cap;
+
+            OW = (int64_t)ceil((double)(W + 2 * pw - dw * (kw - 1) - 1) / sw + 1);
+            int64_t OW_cap = (W + pw - 1) / sw + 1;
+            if (OW > OW_cap) OW = OW_cap;
+        } else {
+            OH = (int64_t)floor((double)(H + 2 * ph - dh * (kh - 1) - 1) / sh + 1);
+            OW = (int64_t)floor((double)(W + 2 * pw - dw * (kw - 1) - 1) / sw + 1);
+        }
     }
 };
 

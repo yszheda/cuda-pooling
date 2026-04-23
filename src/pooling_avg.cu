@@ -23,15 +23,24 @@ __global__ void avgpool_v0_kernel(
     for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
         const int64_t ih = oh * params.sh - params.ph + static_cast<int64_t>(kh_i) * params.dh;
         const bool ih_in = (ih >= 0 && ih < params.H);
+        // When ceil_mode extends the window beyond the padded input,
+        // those out-of-bounds pixels are NOT counted even with count_include_pad.
+        // Only pixels within the actual padding range are counted as padded zeros.
+        const bool ih_pad = (!ih_in && params.count_include_pad &&
+                             ih >= -static_cast<int64_t>(params.ph) &&
+                             ih < params.H + static_cast<int64_t>(params.ph));
         for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
             const int64_t iw = ow * params.sw - params.pw + static_cast<int64_t>(kw_i) * params.dw;
             const bool iw_in = (iw >= 0 && iw < params.W);
+            const bool iw_pad = (!iw_in && params.count_include_pad &&
+                                 iw >= -static_cast<int64_t>(params.pw) &&
+                                 iw < params.W + static_cast<int64_t>(params.pw));
 
             if (ih_in && iw_in) {
                 const int64_t in_idx = ((n * params.H + ih) * params.W + iw) * params.C + c;
                 sum += static_cast<float>(input[in_idx]);
                 count++;
-            } else if (params.count_include_pad) {
+            } else if (ih_pad && iw_pad) {
                 // Padded zero contributes to count but not to sum
                 count++;
             }
