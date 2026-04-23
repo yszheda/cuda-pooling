@@ -424,3 +424,107 @@ void avgpool_v2(const half* input, half* output, const AvgPoolParams& params, cu
     avgpool_v2_kernel<half, VEC><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ============================================================================
+// AvgPool2d v3: register blocking kernel
+// Each thread computes BLOCK consecutive output rows for the same (ow, c).
+// Each output position maintains its own sum and count to correctly handle
+// count_include_pad and divisor_override per position.
+// Falls back to v0 if OH < BLOCK or OH % BLOCK != 0.
+// ============================================================================
+
+template <typename T, int BLOCK>
+__global__ void avgpool_v3_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const AvgPoolParams params)
+{
+    const int64_t n = blockIdx.z;
+    const int64_t OH_block = params.OH / BLOCK;
+    const int64_t total = OH_block * params.OW * params.C;
+    const int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (n >= params.N || flat >= total) return;
+
+    const int64_t c = flat % params.C;
+    const int64_t ow = (flat / params.C) % params.OW;
+    const int64_t oh_base = (flat / params.C / params.OW) * BLOCK;
+
+    float sum[BLOCK];
+    int count[BLOCK];
+    #pragma unroll
+    for (int b = 0; b < BLOCK; ++b) {
+        sum[b] = 0.0f;
+        count[b] = 0;
+    }
+
+    for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+        for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+            const int64_t iw = ow * params.sw - params.pw + static_cast<int64_t>(kw_i) * params.dw;
+            const bool iw_in = (iw >= 0 && iw < params.W);
+            const bool iw_in_pad = (iw >= -static_cast<int64_t>(params.pw) &&
+                                     iw < params.W + static_cast<int64_t>(params.pw));
+
+            #pragma unroll
+            for (int b = 0; b < BLOCK; ++b) {
+                const int64_t oh = oh_base + b;
+                const int64_t ih = oh * params.sh - params.ph + static_cast<int64_t>(kh_i) * params.dh;
+                const bool ih_in = (ih >= 0 && ih < params.H);
+
+                if (ih_in && iw_in) {
+                    const int64_t in_idx = ((n * params.H + ih) * params.W + iw) * params.C + c;
+                    sum[b] += static_cast<float>(input[in_idx]);
+                    count[b]++;
+                } else if (params.count_include_pad) {
+                    const bool ih_in_pad = (ih >= -static_cast<int64_t>(params.ph) &&
+                                             ih < params.H + static_cast<int64_t>(params.ph));
+                    if (ih_in_pad && iw_in_pad) {
+                        count[b]++;
+                    }
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int b = 0; b < BLOCK; ++b) {
+        const int64_t oh = oh_base + b;
+        float divisor;
+        if (params.divisor_override > 0) {
+            divisor = static_cast<float>(params.divisor_override);
+        } else {
+            divisor = static_cast<float>(count[b]);
+        }
+        const int64_t out_idx = ((n * params.OH + oh) * params.OW + ow) * params.C + c;
+        output[out_idx] = static_cast<T>((divisor > 0.0f) ? (sum[b] / divisor) : 0.0f);
+    }
+}
+
+void avgpool_v3(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    constexpr int BLOCK = 4;
+    if (params.OH < BLOCK || params.OH % BLOCK != 0) {
+        avgpool_v0(input, output, params, stream);
+        return;
+    }
+    const int64_t OH_block = params.OH / BLOCK;
+    const int64_t total = OH_block * params.OW * params.C;
+    const int threads = 256;
+    const int blocks_x = static_cast<int>((total + threads - 1) / threads);
+    dim3 grid(blocks_x, 1, static_cast<int>(params.N));
+    avgpool_v3_kernel<float, BLOCK><<<grid, threads, 0, stream>>>(input, output, params);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void avgpool_v3(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    constexpr int BLOCK = 4;
+    if (params.OH < BLOCK || params.OH % BLOCK != 0) {
+        avgpool_v0(input, output, params, stream);
+        return;
+    }
+    const int64_t OH_block = params.OH / BLOCK;
+    const int64_t total = OH_block * params.OW * params.C;
+    const int threads = 256;
+    const int blocks_x = static_cast<int>((total + threads - 1) / threads);
+    dim3 grid(blocks_x, 1, static_cast<int>(params.N));
+    avgpool_v3_kernel<half, BLOCK><<<grid, threads, 0, stream>>>(input, output, params);
+    CUDA_CHECK(cudaGetLastError());
+}

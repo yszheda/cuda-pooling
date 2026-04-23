@@ -51,6 +51,8 @@ void maxpool_v1(const float* input, float* output, const PoolParams& params, cud
 void maxpool_v1(const half* input, half* output, const PoolParams& params, cudaStream_t stream);
 void maxpool_v2(const float* input, float* output, const PoolParams& params, cudaStream_t stream);
 void maxpool_v2(const half* input, half* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v3(const float* input, float* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v3(const half* input, half* output, const PoolParams& params, cudaStream_t stream);
 
 // AvgPool2d launchers (overloaded for float/half)
 void avgpool_v0(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream);
@@ -59,3 +61,5 @@ void avgpool_v1(const float* input, float* output, const AvgPoolParams& params, 
 void avgpool_v1(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream);
 void avgpool_v2(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream);
 void avgpool_v2(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v3(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v3(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream);

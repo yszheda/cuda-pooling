@@ -332,3 +332,88 @@ void maxpool_v2(const half* input, half* output, const PoolParams& params, cudaS
     maxpool_v2_kernel<half, VEC><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ============================================================================
+// MaxPool2d v3: register blocking kernel
+// Each thread computes BLOCK consecutive output rows for the same (ow, c).
+// This increases arithmetic intensity and reuses input data already in
+// registers when stride < kernel_size (adjacent output windows share input).
+// Falls back to v0 if OH < BLOCK or OH % BLOCK != 0.
+// ============================================================================
+
+template <typename T, int BLOCK>
+__global__ void maxpool_v3_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const PoolParams params)
+{
+    const int64_t n = blockIdx.z;
+    const int64_t OH_block = params.OH / BLOCK;  // number of row-blocks
+    const int64_t total = OH_block * params.OW * params.C;
+    const int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (n >= params.N || flat >= total) return;
+
+    const int64_t c = flat % params.C;
+    const int64_t ow = (flat / params.C) % params.OW;
+    const int64_t oh_base = (flat / params.C / params.OW) * BLOCK;
+
+    float maxval[BLOCK];
+    #pragma unroll
+    for (int b = 0; b < BLOCK; ++b)
+        maxval[b] = -INFINITY;
+
+    for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+        for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+            const int64_t iw = ow * params.sw - params.pw + static_cast<int64_t>(kw_i) * params.dw;
+            if (iw < 0 || iw >= params.W) continue;
+
+            #pragma unroll
+            for (int b = 0; b < BLOCK; ++b) {
+                const int64_t oh = oh_base + b;
+                const int64_t ih = oh * params.sh - params.ph + static_cast<int64_t>(kh_i) * params.dh;
+                if (ih < 0 || ih >= params.H) continue;
+
+                const int64_t in_idx = ((n * params.H + ih) * params.W + iw) * params.C + c;
+                float val = static_cast<float>(input[in_idx]);
+                if (val > maxval[b]) maxval[b] = val;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int b = 0; b < BLOCK; ++b) {
+        const int64_t oh = oh_base + b;
+        const int64_t out_idx = ((n * params.OH + oh) * params.OW + ow) * params.C + c;
+        output[out_idx] = static_cast<T>(maxval[b]);
+    }
+}
+
+void maxpool_v3(const float* input, float* output, const PoolParams& params, cudaStream_t stream) {
+    constexpr int BLOCK = 4;
+    if (params.OH < BLOCK || params.OH % BLOCK != 0) {
+        maxpool_v0(input, output, params, stream);
+        return;
+    }
+    const int64_t OH_block = params.OH / BLOCK;
+    const int64_t total = OH_block * params.OW * params.C;
+    const int threads = 256;
+    const int blocks_x = static_cast<int>((total + threads - 1) / threads);
+    dim3 grid(blocks_x, 1, static_cast<int>(params.N));
+    maxpool_v3_kernel<float, BLOCK><<<grid, threads, 0, stream>>>(input, output, params);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void maxpool_v3(const half* input, half* output, const PoolParams& params, cudaStream_t stream) {
+    constexpr int BLOCK = 4;
+    if (params.OH < BLOCK || params.OH % BLOCK != 0) {
+        maxpool_v0(input, output, params, stream);
+        return;
+    }
+    const int64_t OH_block = params.OH / BLOCK;
+    const int64_t total = OH_block * params.OW * params.C;
+    const int threads = 256;
+    const int blocks_x = static_cast<int>((total + threads - 1) / threads);
+    dim3 grid(blocks_x, 1, static_cast<int>(params.N));
+    maxpool_v3_kernel<half, BLOCK><<<grid, threads, 0, stream>>>(input, output, params);
+    CUDA_CHECK(cudaGetLastError());
+}
