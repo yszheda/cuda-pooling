@@ -1025,3 +1025,292 @@ void avgpool_v5(const half* input, half* output, const AvgPoolParams& params, cu
         input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ============================================================================
+// AvgPool2d v6: warp specialization kernel
+// Split warps in a block into two roles: "load warps" that fetch data from
+// global memory into shared memory, and "compute warps" that read from shared
+// memory and compute the average. This decouples memory latency from compute.
+//
+// Block size: 256 threads = 8 warps
+// NUM_LOAD_WARPS = 2 (warp 0-1), NUM_COMPUTE_WARPS = 6 (warp 2-7)
+// Same tiling as v1: TILE_OH=8, TILE_OW=8 per (n, c) pair
+// Falls back to v1 if smem is too large.
+// ============================================================================
+
+template <int TILE_OH = 8, int TILE_OW = 8, int NUM_LOAD_WARPS = 2, int NUM_COMPUTE_WARPS = 6>
+__global__ void avgpool_v6_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    const AvgPoolParams params,
+    int blocks_oh, int blocks_ow,
+    int smem_h, int smem_w)
+{
+    constexpr int NUM_LOAD_THREADS = NUM_LOAD_WARPS * 32;                  // 64
+    constexpr int NUM_COMPUTE_THREADS = NUM_COMPUTE_WARPS * 32;            // 192
+    constexpr int TILE_SIZE = TILE_OH * TILE_OW;                           // 64
+
+    extern __shared__ float sdata[];
+
+    const int n = blockIdx.z;
+    const int c = blockIdx.y;
+    const int tile_idx = blockIdx.x;
+    const int tile_oh = tile_idx / blocks_ow;
+    const int tile_ow = tile_idx % blocks_ow;
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const bool is_load_warp = warp_id < NUM_LOAD_WARPS;
+
+    const int ih_start = tile_oh * TILE_OH * params.sh - params.ph;
+    const int iw_start = tile_ow * TILE_OW * params.sw - params.pw;
+
+    const int total_smem = smem_h * smem_w;
+
+    // Phase 1: Load warps cooperatively load input tile into shared memory
+    if (is_load_warp) {
+        for (int i = tid; i < total_smem; i += NUM_LOAD_THREADS) {
+            const int sih = i / smem_w;
+            const int siw = i % smem_w;
+            const int ih = ih_start + sih;
+            const int iw = iw_start + siw;
+            if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+                const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c;
+                sdata[i] = input[in_idx];
+            } else {
+                sdata[i] = 0.0f;  // Padded positions contribute 0 to sum
+            }
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: Compute warps compute avg from shared memory
+    if (!is_load_warp) {
+        const int compute_tid = tid - NUM_LOAD_THREADS;  // 0..191
+
+        for (int i = compute_tid; i < TILE_SIZE; i += NUM_COMPUTE_THREADS) {
+            const int th = i / TILE_OW;
+            const int tw = i % TILE_OW;
+            const int oh = tile_oh * TILE_OH + th;
+            const int ow = tile_ow * TILE_OW + tw;
+
+            if (oh >= params.OH || ow >= params.OW) continue;
+
+            float sum = 0.0f;
+            int count = 0;
+
+            for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+                const int sih = th * params.sh + kh_i * params.dh;
+                if (sih >= smem_h) continue;
+                const int64_t ih = static_cast<int64_t>(ih_start) + sih;
+
+                for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+                    const int siw = tw * params.sw + kw_i * params.dw;
+                    if (siw >= smem_w) continue;
+                    const int64_t iw = static_cast<int64_t>(iw_start) + siw;
+
+                    const bool ih_in = (ih >= 0 && ih < params.H);
+                    const bool iw_in = (iw >= 0 && iw < params.W);
+
+                    if (ih_in && iw_in) {
+                        sum += sdata[sih * smem_w + siw];
+                        count++;
+                    } else if (params.count_include_pad) {
+                        const bool ih_in_pad = (ih >= -static_cast<int64_t>(params.ph) &&
+                                                ih < params.H + static_cast<int64_t>(params.ph));
+                        const bool iw_in_pad = (iw >= -static_cast<int64_t>(params.pw) &&
+                                                iw < params.W + static_cast<int64_t>(params.pw));
+                        if (ih_in_pad && iw_in_pad) {
+                            count++;
+                        }
+                    }
+                }
+            }
+
+            float divisor;
+            if (params.divisor_override > 0) {
+                divisor = static_cast<float>(params.divisor_override);
+            } else {
+                divisor = static_cast<float>(count);
+            }
+
+            const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c;
+            output[out_idx] = (divisor > 0.0f) ? (sum / divisor) : 0.0f;
+        }
+    }
+}
+
+// half specialization
+template <int TILE_OH = 8, int TILE_OW = 8, int NUM_LOAD_WARPS = 2, int NUM_COMPUTE_WARPS = 6>
+__global__ void avgpool_v6_kernel_half(
+    const half* __restrict__ input,
+    half* __restrict__ output,
+    const AvgPoolParams params,
+    int blocks_oh, int blocks_ow,
+    int smem_h, int smem_w)
+{
+    constexpr int NUM_LOAD_THREADS = NUM_LOAD_WARPS * 32;
+    constexpr int NUM_COMPUTE_THREADS = NUM_COMPUTE_WARPS * 32;
+    constexpr int TILE_SIZE = TILE_OH * TILE_OW;
+
+    extern __shared__ float sdata[];
+
+    const int n = blockIdx.z;
+    const int c = blockIdx.y;
+    const int tile_idx = blockIdx.x;
+    const int tile_oh = tile_idx / blocks_ow;
+    const int tile_ow = tile_idx % blocks_ow;
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const bool is_load_warp = warp_id < NUM_LOAD_WARPS;
+
+    const int ih_start = tile_oh * TILE_OH * params.sh - params.ph;
+    const int iw_start = tile_ow * TILE_OW * params.sw - params.pw;
+
+    const int total_smem = smem_h * smem_w;
+
+    if (is_load_warp) {
+        for (int i = tid; i < total_smem; i += NUM_LOAD_THREADS) {
+            const int sih = i / smem_w;
+            const int siw = i % smem_w;
+            const int ih = ih_start + sih;
+            const int iw = iw_start + siw;
+            if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+                const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c;
+                sdata[i] = static_cast<float>(input[in_idx]);
+            } else {
+                sdata[i] = 0.0f;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (!is_load_warp) {
+        const int compute_tid = tid - NUM_LOAD_THREADS;
+
+        for (int i = compute_tid; i < TILE_SIZE; i += NUM_COMPUTE_THREADS) {
+            const int th = i / TILE_OW;
+            const int tw = i % TILE_OW;
+            const int oh = tile_oh * TILE_OH + th;
+            const int ow = tile_ow * TILE_OW + tw;
+
+            if (oh >= params.OH || ow >= params.OW) continue;
+
+            float sum = 0.0f;
+            int count = 0;
+
+            for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+                const int sih = th * params.sh + kh_i * params.dh;
+                if (sih >= smem_h) continue;
+                const int64_t ih = static_cast<int64_t>(ih_start) + sih;
+
+                for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+                    const int siw = tw * params.sw + kw_i * params.dw;
+                    if (siw >= smem_w) continue;
+                    const int64_t iw = static_cast<int64_t>(iw_start) + siw;
+
+                    const bool ih_in = (ih >= 0 && ih < params.H);
+                    const bool iw_in = (iw >= 0 && iw < params.W);
+
+                    if (ih_in && iw_in) {
+                        sum += sdata[sih * smem_w + siw];
+                        count++;
+                    } else if (params.count_include_pad) {
+                        const bool ih_in_pad = (ih >= -static_cast<int64_t>(params.ph) &&
+                                                ih < params.H + static_cast<int64_t>(params.ph));
+                        const bool iw_in_pad = (iw >= -static_cast<int64_t>(params.pw) &&
+                                                iw < params.W + static_cast<int64_t>(params.pw));
+                        if (ih_in_pad && iw_in_pad) {
+                            count++;
+                        }
+                    }
+                }
+            }
+
+            float divisor;
+            if (params.divisor_override > 0) {
+                divisor = static_cast<float>(params.divisor_override);
+            } else {
+                divisor = static_cast<float>(count);
+            }
+
+            const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c;
+            output[out_idx] = static_cast<half>((divisor > 0.0f) ? (sum / divisor) : 0.0f);
+        }
+    }
+}
+
+void avgpool_v6(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    constexpr int TILE_OH = 8;
+    constexpr int TILE_OW = 8;
+    constexpr int BLOCK_SIZE = 256;
+
+    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
+    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
+
+    int smem_h = (TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1;
+    int smem_w = (TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1;
+    smem_h = min(smem_h, static_cast<int>(params.H + 2 * params.ph));
+    smem_w = min(smem_w, static_cast<int>(params.W + 2 * params.pw));
+
+    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(float);
+
+    int smem_limit = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+    if (smem_bytes > static_cast<size_t>(smem_limit)) {
+        avgpool_v1(input, output, params, stream);
+        return;
+    }
+
+    dim3 block(BLOCK_SIZE);
+    dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
+
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            avgpool_v6_kernel<TILE_OH, TILE_OW>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem_bytes)));
+    }
+
+    avgpool_v6_kernel<TILE_OH, TILE_OW><<<grid, block, smem_bytes, stream>>>(
+        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void avgpool_v6(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    constexpr int TILE_OH = 8;
+    constexpr int TILE_OW = 8;
+    constexpr int BLOCK_SIZE = 256;
+
+    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
+    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
+
+    int smem_h = (TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1;
+    int smem_w = (TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1;
+    smem_h = min(smem_h, static_cast<int>(params.H + 2 * params.ph));
+    smem_w = min(smem_w, static_cast<int>(params.W + 2 * params.pw));
+
+    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(float);
+
+    int smem_limit = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+    if (smem_bytes > static_cast<size_t>(smem_limit)) {
+        avgpool_v1(input, output, params, stream);
+        return;
+    }
+
+    dim3 block(BLOCK_SIZE);
+    dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
+
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            avgpool_v6_kernel_half<TILE_OH, TILE_OW>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem_bytes)));
+    }
+
+    avgpool_v6_kernel_half<TILE_OH, TILE_OW><<<grid, block, smem_bytes, stream>>>(
+        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
+    CUDA_CHECK(cudaGetLastError());
+}

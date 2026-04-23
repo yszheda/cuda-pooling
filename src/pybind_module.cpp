@@ -118,6 +118,9 @@ py::array_t<float> maxpool2d_f32(
         case 5:
             maxpool_v5(d_input, d_output, params, 0);
             break;
+        case 6:
+            maxpool_v6(d_input, d_output, params, 0);
+            break;
         default:
             CUDA_CHECK(cudaFree(d_input));
             CUDA_CHECK(cudaFree(d_output));
@@ -190,6 +193,9 @@ py::array maxpool2d_f16(
             break;
         case 5:
             maxpool_v5(d_input, d_output, params, 0);
+            break;
+        case 6:
+            maxpool_v6(d_input, d_output, params, 0);
             break;
         default:
             CUDA_CHECK(cudaFree(d_input));
@@ -286,6 +292,9 @@ py::array_t<float> avgpool2d_f32(
         case 5:
             avgpool_v5(d_input, d_output, params, 0);
             break;
+        case 6:
+            avgpool_v6(d_input, d_output, params, 0);
+            break;
         default:
             CUDA_CHECK(cudaFree(d_input));
             CUDA_CHECK(cudaFree(d_output));
@@ -360,6 +369,9 @@ py::array avgpool2d_f16(
             break;
         case 5:
             avgpool_v5(d_input, d_output, params, 0);
+            break;
+        case 6:
+            avgpool_v6(d_input, d_output, params, 0);
             break;
         default:
             CUDA_CHECK(cudaFree(d_input));
