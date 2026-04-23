@@ -13,7 +13,7 @@ TOLERANCES = {
 }
 
 MAXPOOL_VERSIONS = [0, 1]
-AVGPOOL_VERSIONS = [0]
+AVGPOOL_VERSIONS = [0, 1]
 
 
 def _is_valid_maxpool_padding(kernel_size, padding, dilation):
