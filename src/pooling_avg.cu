@@ -58,21 +58,25 @@ __global__ void avgpool_v0_kernel(
 }
 
 void avgpool_v0(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v0_f32", NVTX_COLOR_AVGPOOL);
     const int64_t total = params.OH * params.OW * params.C;
     const int threads = 256;
     const int blocks_x = static_cast<int>((total + threads - 1) / threads);
     dim3 grid(blocks_x, 1, static_cast<int>(params.N));
     avgpool_v0_kernel<float><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 void avgpool_v0(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v0_f16", NVTX_COLOR_AVGPOOL);
     const int64_t total = params.OH * params.OW * params.C;
     const int threads = 256;
     const int blocks_x = static_cast<int>((total + threads - 1) / threads);
     dim3 grid(blocks_x, 1, static_cast<int>(params.N));
     avgpool_v0_kernel<half><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 // ============================================================================
@@ -262,6 +266,7 @@ __global__ void avgpool_v1_kernel_half(
 }
 
 void avgpool_v1(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v1_f32", NVTX_COLOR_AVGPOOL);
     constexpr int TILE_OH = 8;
     constexpr int TILE_OW = 8;
 
@@ -282,9 +287,11 @@ void avgpool_v1(const float* input, float* output, const AvgPoolParams& params, 
     avgpool_v1_kernel<TILE_OH, TILE_OW><<<grid, block, smem_bytes, stream>>>(
         input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 void avgpool_v1(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v1_f16", NVTX_COLOR_AVGPOOL);
     constexpr int TILE_OH = 8;
     constexpr int TILE_OW = 8;
 
@@ -303,6 +310,7 @@ void avgpool_v1(const half* input, half* output, const AvgPoolParams& params, cu
     avgpool_v1_kernel_half<TILE_OH, TILE_OW><<<grid, block, smem_bytes, stream>>>(
         input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 // ============================================================================
@@ -396,8 +404,10 @@ __global__ void avgpool_v2_kernel(
 }
 
 void avgpool_v2(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v2_f32", NVTX_COLOR_AVGPOOL);
     constexpr int VEC = 4;
     if (params.C % VEC != 0) {
+        NVTX_RANGE_POP();
         avgpool_v0(input, output, params, stream);
         return;
     }
@@ -408,11 +418,14 @@ void avgpool_v2(const float* input, float* output, const AvgPoolParams& params, 
     dim3 grid(blocks_x, 1, static_cast<int>(params.N));
     avgpool_v2_kernel<float, VEC><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 void avgpool_v2(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v2_f16", NVTX_COLOR_AVGPOOL);
     constexpr int VEC = 2;
     if (params.C % VEC != 0) {
+        NVTX_RANGE_POP();
         avgpool_v0(input, output, params, stream);
         return;
     }
@@ -423,6 +436,7 @@ void avgpool_v2(const half* input, half* output, const AvgPoolParams& params, cu
     dim3 grid(blocks_x, 1, static_cast<int>(params.N));
     avgpool_v2_kernel<half, VEC><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 // ============================================================================
@@ -500,8 +514,10 @@ __global__ void avgpool_v3_kernel(
 }
 
 void avgpool_v3(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v3_f32", NVTX_COLOR_AVGPOOL);
     constexpr int BLOCK = 4;
     if (params.OH < BLOCK || params.OH % BLOCK != 0) {
+        NVTX_RANGE_POP();
         avgpool_v0(input, output, params, stream);
         return;
     }
@@ -512,11 +528,14 @@ void avgpool_v3(const float* input, float* output, const AvgPoolParams& params, 
     dim3 grid(blocks_x, 1, static_cast<int>(params.N));
     avgpool_v3_kernel<float, BLOCK><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 void avgpool_v3(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v3_f16", NVTX_COLOR_AVGPOOL);
     constexpr int BLOCK = 4;
     if (params.OH < BLOCK || params.OH % BLOCK != 0) {
+        NVTX_RANGE_POP();
         avgpool_v0(input, output, params, stream);
         return;
     }
@@ -527,6 +546,7 @@ void avgpool_v3(const half* input, half* output, const AvgPoolParams& params, cu
     dim3 grid(blocks_x, 1, static_cast<int>(params.N));
     avgpool_v3_kernel<half, BLOCK><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 // ============================================================================
@@ -612,6 +632,7 @@ __global__ void avgpool_v4_kernel(
 }
 
 void avgpool_v4(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v4_f32", NVTX_COLOR_AVGPOOL);
     const int64_t total = params.OH * params.OW * params.C;
     const int threads = 256;
     const int warps_per_block = threads / 32;  // 8
@@ -619,9 +640,11 @@ void avgpool_v4(const float* input, float* output, const AvgPoolParams& params, 
     dim3 grid(blocks_x, 1, static_cast<int>(params.N));
     avgpool_v4_kernel<float><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 void avgpool_v4(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v4_f16", NVTX_COLOR_AVGPOOL);
     const int64_t total = params.OH * params.OW * params.C;
     const int threads = 256;
     const int warps_per_block = threads / 32;  // 8
@@ -629,6 +652,7 @@ void avgpool_v4(const half* input, half* output, const AvgPoolParams& params, cu
     dim3 grid(blocks_x, 1, static_cast<int>(params.N));
     avgpool_v4_kernel<half><<<grid, threads, 0, stream>>>(input, output, params);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 // ============================================================================
@@ -943,10 +967,12 @@ __global__ void avgpool_v5_kernel_half(
 }
 
 void avgpool_v5(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v5_f32", NVTX_COLOR_AVGPOOL);
     constexpr int TILE_OH = 8;
     constexpr int TILE_OW = 8;
 
     if (params.C < 2) {
+        NVTX_RANGE_POP();
         avgpool_v1(input, output, params, stream);
         return;
     }
@@ -964,6 +990,7 @@ void avgpool_v5(const float* input, float* output, const AvgPoolParams& params, 
     int smem_limit = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
     if (smem_bytes > static_cast<size_t>(smem_limit)) {
+        NVTX_RANGE_POP();
         avgpool_v1(input, output, params, stream);
         return;
     }
@@ -982,13 +1009,16 @@ void avgpool_v5(const float* input, float* output, const AvgPoolParams& params, 
     avgpool_v5_kernel<TILE_OH, TILE_OW><<<grid, block, smem_bytes, stream>>>(
         input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 void avgpool_v5(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v5_f16", NVTX_COLOR_AVGPOOL);
     constexpr int TILE_OH = 8;
     constexpr int TILE_OW = 8;
 
     if (params.C < 2) {
+        NVTX_RANGE_POP();
         avgpool_v1(input, output, params, stream);
         return;
     }
@@ -1006,6 +1036,7 @@ void avgpool_v5(const half* input, half* output, const AvgPoolParams& params, cu
     int smem_limit = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
     if (smem_bytes > static_cast<size_t>(smem_limit)) {
+        NVTX_RANGE_POP();
         avgpool_v1(input, output, params, stream);
         return;
     }
@@ -1024,6 +1055,7 @@ void avgpool_v5(const half* input, half* output, const AvgPoolParams& params, cu
     avgpool_v5_kernel_half<TILE_OH, TILE_OW><<<grid, block, smem_bytes, stream>>>(
         input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 // ============================================================================
@@ -1242,6 +1274,7 @@ __global__ void avgpool_v6_kernel_half(
 }
 
 void avgpool_v6(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v6_f32", NVTX_COLOR_AVGPOOL);
     constexpr int TILE_OH = 8;
     constexpr int TILE_OW = 8;
     constexpr int BLOCK_SIZE = 256;
@@ -1259,6 +1292,7 @@ void avgpool_v6(const float* input, float* output, const AvgPoolParams& params, 
     int smem_limit = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
     if (smem_bytes > static_cast<size_t>(smem_limit)) {
+        NVTX_RANGE_POP();
         avgpool_v1(input, output, params, stream);
         return;
     }
@@ -1276,9 +1310,11 @@ void avgpool_v6(const float* input, float* output, const AvgPoolParams& params, 
     avgpool_v6_kernel<TILE_OH, TILE_OW><<<grid, block, smem_bytes, stream>>>(
         input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 void avgpool_v6(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v6_f16", NVTX_COLOR_AVGPOOL);
     constexpr int TILE_OH = 8;
     constexpr int TILE_OW = 8;
     constexpr int BLOCK_SIZE = 256;
@@ -1296,6 +1332,7 @@ void avgpool_v6(const half* input, half* output, const AvgPoolParams& params, cu
     int smem_limit = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
     if (smem_bytes > static_cast<size_t>(smem_limit)) {
+        NVTX_RANGE_POP();
         avgpool_v1(input, output, params, stream);
         return;
     }
@@ -1313,6 +1350,7 @@ void avgpool_v6(const half* input, half* output, const AvgPoolParams& params, cu
     avgpool_v6_kernel_half<TILE_OH, TILE_OW><<<grid, block, smem_bytes, stream>>>(
         input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
     CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
 }
 
 // ============================================================================
@@ -1552,19 +1590,22 @@ __global__ void avgpool_v7_mappingD_kernel(
 // --- v7 launcher: dispatches to the appropriate mapping kernel ---
 
 void avgpool_v7(const float* input, float* output, const AvgPoolParams& params, int mapping, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v7_f32", NVTX_COLOR_AVGPOOL);
     switch (mapping) {
         case 0: {
             // Mapping A: 1D flat — same as v0
+            NVTX_RANGE_POP();
             avgpool_v0(input, output, params, stream);
-            break;
+            return;
         }
         case 1: {
             // Mapping B: 2D spatial tiling
             const int C_groups = static_cast<int>((params.C + 3) / 4);
             const int64_t grid_z_64 = params.N * C_groups;
             if (grid_z_64 > 65535) {
+                NVTX_RANGE_POP();
                 avgpool_v0(input, output, params, stream);
-                break;
+                return;
             }
             dim3 block(8, 8, 4);
             dim3 grid(
@@ -1580,8 +1621,9 @@ void avgpool_v7(const float* input, float* output, const AvgPoolParams& params, 
             const int C_groups = static_cast<int>((params.C + 255) / 256);
             const int64_t grid_z_64 = params.N * C_groups;
             if (params.OW > 65535 || params.OH > 65535 || grid_z_64 > 65535) {
+                NVTX_RANGE_POP();
                 avgpool_v0(input, output, params, stream);
-                break;
+                return;
             }
             dim3 block(256, 1, 1);
             dim3 grid(
@@ -1595,14 +1637,16 @@ void avgpool_v7(const float* input, float* output, const AvgPoolParams& params, 
         case 3: {
             // Mapping D: hybrid warp-spatial + vectorized
             if (params.C % 4 != 0) {
+                NVTX_RANGE_POP();
                 avgpool_v0(input, output, params, stream);
-                break;
+                return;
             }
             const int C_groups = static_cast<int>((params.C + 31) / 32);
             const int64_t grid_z_64 = params.N * C_groups;
             if (grid_z_64 > 65535) {
+                NVTX_RANGE_POP();
                 avgpool_v0(input, output, params, stream);
-                break;
+                return;
             }
             dim3 block(32, 8, 1);
             dim3 grid(
@@ -1614,22 +1658,27 @@ void avgpool_v7(const float* input, float* output, const AvgPoolParams& params, 
             break;
         }
         default:
+            NVTX_RANGE_POP();
             throw std::invalid_argument("unsupported mapping: " + std::to_string(mapping));
     }
+    NVTX_RANGE_POP();
 }
 
 void avgpool_v7(const half* input, half* output, const AvgPoolParams& params, int mapping, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v7_f16", NVTX_COLOR_AVGPOOL);
     switch (mapping) {
         case 0: {
+            NVTX_RANGE_POP();
             avgpool_v0(input, output, params, stream);
-            break;
+            return;
         }
         case 1: {
             const int C_groups = static_cast<int>((params.C + 3) / 4);
             const int64_t grid_z_64 = params.N * C_groups;
             if (grid_z_64 > 65535) {
+                NVTX_RANGE_POP();
                 avgpool_v0(input, output, params, stream);
-                break;
+                return;
             }
             dim3 block(8, 8, 4);
             dim3 grid(
@@ -1644,8 +1693,9 @@ void avgpool_v7(const half* input, half* output, const AvgPoolParams& params, in
             const int C_groups = static_cast<int>((params.C + 255) / 256);
             const int64_t grid_z_64 = params.N * C_groups;
             if (params.OW > 65535 || params.OH > 65535 || grid_z_64 > 65535) {
+                NVTX_RANGE_POP();
                 avgpool_v0(input, output, params, stream);
-                break;
+                return;
             }
             dim3 block(256, 1, 1);
             dim3 grid(
@@ -1658,14 +1708,16 @@ void avgpool_v7(const half* input, half* output, const AvgPoolParams& params, in
         }
         case 3: {
             if (params.C % 4 != 0) {
+                NVTX_RANGE_POP();
                 avgpool_v0(input, output, params, stream);
-                break;
+                return;
             }
             const int C_groups = static_cast<int>((params.C + 31) / 32);
             const int64_t grid_z_64 = params.N * C_groups;
             if (grid_z_64 > 65535) {
+                NVTX_RANGE_POP();
                 avgpool_v0(input, output, params, stream);
-                break;
+                return;
             }
             dim3 block(32, 8, 1);
             dim3 grid(
@@ -1677,6 +1729,8 @@ void avgpool_v7(const half* input, half* output, const AvgPoolParams& params, in
             break;
         }
         default:
+            NVTX_RANGE_POP();
             throw std::invalid_argument("unsupported mapping: " + std::to_string(mapping));
     }
+    NVTX_RANGE_POP();
 }

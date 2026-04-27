@@ -11,6 +11,34 @@
     do { cudaError_t err = call; if (err != cudaSuccess) \
          throw std::runtime_error(cudaGetErrorString(err)); } while(0)
 
+// NVTX profiling macros — no-ops when ENABLE_NVTX is not defined
+#ifdef ENABLE_NVTX
+#include <nvtx3/nvToolsExt.h>
+
+// NVTX color constants (ARGB)
+#define NVTX_COLOR_MAXPOOL  0xFF4169E1  // Blue
+#define NVTX_COLOR_AVGPOOL  0xFF2E8B57  // Green
+
+inline void _nvtx_range_push_color(const char* name, uint32_t color) {
+    nvtxEventAttributes_t attr = {};
+    attr.version = NVTX_VERSION;
+    attr.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+    attr.colorType = NVTX_COLOR_ARGB;
+    attr.color = color;
+    attr.messageType = NVTX_MESSAGE_TYPE_ASCII;
+    attr.message.ascii = name;
+    nvtxRangePushEx(&attr);
+}
+
+#define NVTX_RANGE_PUSH(name)        nvtxRangePushA(name)
+#define NVTX_RANGE_POP()             nvtxRangePop()
+#define NVTX_RANGE_PUSH_C(name, c)   _nvtx_range_push_color(name, c)
+#else
+#define NVTX_RANGE_PUSH(name)
+#define NVTX_RANGE_POP()
+#define NVTX_RANGE_PUSH_C(name, c)
+#endif
+
 struct PoolParams {
     int64_t N, H, W, C;
     int kh, kw;

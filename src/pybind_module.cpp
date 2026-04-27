@@ -408,6 +408,342 @@ py::array avgpool2d_f16(
     return output;
 }
 
+// ==================== CUDA synchronize ====================
+
+void cuda_synchronize() {
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+// ==================== Timed MaxPool2d (CUDA events, kernel-only) ====================
+
+// Helper: launch maxpool kernel for a given version, record CUDA events around it.
+// Returns elapsed milliseconds for the kernel only.
+static float maxpool_launch_timed(
+    const float* d_input, float* d_output, const PoolParams& params,
+    int version, int mapping, cudaStream_t stream)
+{
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    CUDA_CHECK(cudaEventRecord(start, stream));
+    switch (version) {
+        case 0: maxpool_v0(d_input, d_output, params, stream); break;
+        case 1: maxpool_v1(d_input, d_output, params, stream); break;
+        case 2: maxpool_v2(d_input, d_output, params, stream); break;
+        case 3: maxpool_v3(d_input, d_output, params, stream); break;
+        case 4: maxpool_v4(d_input, d_output, params, stream); break;
+        case 5: maxpool_v5(d_input, d_output, params, stream); break;
+        case 6: maxpool_v6(d_input, d_output, params, stream); break;
+        case 7: maxpool_v7(d_input, d_output, params, mapping, stream); break;
+        default:
+            CUDA_CHECK(cudaEventDestroy(start));
+            CUDA_CHECK(cudaEventDestroy(stop));
+            throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
+    }
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return elapsed_ms;
+}
+
+static float maxpool_launch_timed(
+    const half* d_input, half* d_output, const PoolParams& params,
+    int version, int mapping, cudaStream_t stream)
+{
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    CUDA_CHECK(cudaEventRecord(start, stream));
+    switch (version) {
+        case 0: maxpool_v0(d_input, d_output, params, stream); break;
+        case 1: maxpool_v1(d_input, d_output, params, stream); break;
+        case 2: maxpool_v2(d_input, d_output, params, stream); break;
+        case 3: maxpool_v3(d_input, d_output, params, stream); break;
+        case 4: maxpool_v4(d_input, d_output, params, stream); break;
+        case 5: maxpool_v5(d_input, d_output, params, stream); break;
+        case 6: maxpool_v6(d_input, d_output, params, stream); break;
+        case 7: maxpool_v7(d_input, d_output, params, mapping, stream); break;
+        default:
+            CUDA_CHECK(cudaEventDestroy(start));
+            CUDA_CHECK(cudaEventDestroy(stop));
+            throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
+    }
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return elapsed_ms;
+}
+
+py::tuple maxpool2d_timed_f32(
+    py::array_t<float, py::array::c_style | py::array::forcecast> input,
+    const py::object& kernel_size,
+    const py::object& stride,
+    const py::object& padding,
+    const py::object& dilation,
+    bool ceil_mode,
+    int version,
+    int mapping)
+{
+    NVTX_RANGE_PUSH("maxpool2d_timed_f32");
+    auto buf = input.request();
+    if (buf.ndim != 4)
+        throw std::invalid_argument("input must be 4-D [N, H, W, C]");
+
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+
+    auto params = make_pool_params(buf.shape, kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode);
+    size_t in_nelms = buf.size;
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+
+    float* d_input = nullptr;
+    float* d_output = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_input, in_nelms * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_output, out_nelms * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_input, buf.ptr, in_nelms * sizeof(float), cudaMemcpyHostToDevice));
+
+    float elapsed_ms = maxpool_launch_timed(d_input, d_output, params, version, mapping, 0);
+
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    auto output = py::array_t<float>(out_shape);
+    auto out_buf = output.request();
+    CUDA_CHECK(cudaMemcpy(out_buf.ptr, d_output, out_nelms * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_output));
+
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
+py::tuple maxpool2d_timed_f16(
+    py::array input,
+    const py::object& kernel_size,
+    const py::object& stride,
+    const py::object& padding,
+    const py::object& dilation,
+    bool ceil_mode,
+    int version,
+    int mapping)
+{
+    NVTX_RANGE_PUSH("maxpool2d_timed_f16");
+    validate_float16(input);
+    input = ensure_c_contiguous(input);
+
+    if (input.ndim() != 4)
+        throw std::invalid_argument("input must be 4-D [N, H, W, C]");
+
+    auto shape = array_shape(input);
+    size_t in_nbytes = input.size() * sizeof(half);
+
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+
+    auto params = make_pool_params(shape, kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode);
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+    size_t out_nbytes = out_nelms * sizeof(half);
+
+    half* d_input = nullptr;
+    half* d_output = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_input, in_nbytes));
+    CUDA_CHECK(cudaMalloc(&d_output, out_nbytes));
+    CUDA_CHECK(cudaMemcpy(d_input, input.data(), in_nbytes, cudaMemcpyHostToDevice));
+
+    float elapsed_ms = maxpool_launch_timed(d_input, d_output, params, version, mapping, 0);
+
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    py::module_ np = py::module_::import("numpy");
+    auto output = np.attr("empty")(out_shape, np.attr("float16")).cast<py::array>();
+
+    CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nbytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_output));
+
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
+// ==================== Timed AvgPool2d (CUDA events, kernel-only) ====================
+
+static float avgpool_launch_timed(
+    const float* d_input, float* d_output, const AvgPoolParams& params,
+    int version, int mapping, cudaStream_t stream)
+{
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    CUDA_CHECK(cudaEventRecord(start, stream));
+    switch (version) {
+        case 0: avgpool_v0(d_input, d_output, params, stream); break;
+        case 1: avgpool_v1(d_input, d_output, params, stream); break;
+        case 2: avgpool_v2(d_input, d_output, params, stream); break;
+        case 3: avgpool_v3(d_input, d_output, params, stream); break;
+        case 4: avgpool_v4(d_input, d_output, params, stream); break;
+        case 5: avgpool_v5(d_input, d_output, params, stream); break;
+        case 6: avgpool_v6(d_input, d_output, params, stream); break;
+        case 7: avgpool_v7(d_input, d_output, params, mapping, stream); break;
+        default:
+            CUDA_CHECK(cudaEventDestroy(start));
+            CUDA_CHECK(cudaEventDestroy(stop));
+            throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
+    }
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return elapsed_ms;
+}
+
+static float avgpool_launch_timed(
+    const half* d_input, half* d_output, const AvgPoolParams& params,
+    int version, int mapping, cudaStream_t stream)
+{
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    CUDA_CHECK(cudaEventRecord(start, stream));
+    switch (version) {
+        case 0: avgpool_v0(d_input, d_output, params, stream); break;
+        case 1: avgpool_v1(d_input, d_output, params, stream); break;
+        case 2: avgpool_v2(d_input, d_output, params, stream); break;
+        case 3: avgpool_v3(d_input, d_output, params, stream); break;
+        case 4: avgpool_v4(d_input, d_output, params, stream); break;
+        case 5: avgpool_v5(d_input, d_output, params, stream); break;
+        case 6: avgpool_v6(d_input, d_output, params, stream); break;
+        case 7: avgpool_v7(d_input, d_output, params, mapping, stream); break;
+        default:
+            CUDA_CHECK(cudaEventDestroy(start));
+            CUDA_CHECK(cudaEventDestroy(stop));
+            throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
+    }
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return elapsed_ms;
+}
+
+py::tuple avgpool2d_timed_f32(
+    py::array_t<float, py::array::c_style | py::array::forcecast> input,
+    const py::object& kernel_size,
+    const py::object& stride,
+    const py::object& padding,
+    const py::object& dilation,
+    bool ceil_mode,
+    bool count_include_pad,
+    const py::object& divisor_override,
+    int version,
+    int mapping)
+{
+    NVTX_RANGE_PUSH("avgpool2d_timed_f32");
+    auto buf = input.request();
+    if (buf.ndim != 4)
+        throw std::invalid_argument("input must be 4-D [N, H, W, C]");
+
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+
+    int64_t div_over = divisor_override.is_none() ? 0 : divisor_override.cast<int64_t>();
+    auto params = make_avgpool_params(buf.shape, kh, kw, sh, sw, ph, pw, dh, dw,
+                                      ceil_mode, count_include_pad, div_over);
+    size_t in_nelms = buf.size;
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+
+    float* d_input = nullptr;
+    float* d_output = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_input, in_nelms * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_output, out_nelms * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_input, buf.ptr, in_nelms * sizeof(float), cudaMemcpyHostToDevice));
+
+    float elapsed_ms = avgpool_launch_timed(d_input, d_output, params, version, mapping, 0);
+
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    auto output = py::array_t<float>(out_shape);
+    auto out_buf = output.request();
+    CUDA_CHECK(cudaMemcpy(out_buf.ptr, d_output, out_nelms * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_output));
+
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
+py::tuple avgpool2d_timed_f16(
+    py::array input,
+    const py::object& kernel_size,
+    const py::object& stride,
+    const py::object& padding,
+    const py::object& dilation,
+    bool ceil_mode,
+    bool count_include_pad,
+    const py::object& divisor_override,
+    int version,
+    int mapping)
+{
+    NVTX_RANGE_PUSH("avgpool2d_timed_f16");
+    validate_float16(input);
+    input = ensure_c_contiguous(input);
+
+    if (input.ndim() != 4)
+        throw std::invalid_argument("input must be 4-D [N, H, W, C]");
+
+    auto shape = array_shape(input);
+    size_t in_nbytes = input.size() * sizeof(half);
+
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+
+    int64_t div_over = divisor_override.is_none() ? 0 : divisor_override.cast<int64_t>();
+    auto params = make_avgpool_params(shape, kh, kw, sh, sw, ph, pw, dh, dw,
+                                      ceil_mode, count_include_pad, div_over);
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+    size_t out_nbytes = out_nelms * sizeof(half);
+
+    half* d_input = nullptr;
+    half* d_output = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_input, in_nbytes));
+    CUDA_CHECK(cudaMalloc(&d_output, out_nbytes));
+    CUDA_CHECK(cudaMemcpy(d_input, input.data(), in_nbytes, cudaMemcpyHostToDevice));
+
+    float elapsed_ms = avgpool_launch_timed(d_input, d_output, params, version, mapping, 0);
+
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    py::module_ np = py::module_::import("numpy");
+    auto output = np.attr("empty")(out_shape, np.attr("float16")).cast<py::array>();
+
+    CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nbytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_output));
+
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
 PYBIND11_MODULE(_pooling, m) {
     m.doc() = "CUDA Pooling2D kernels";
 
@@ -444,6 +780,55 @@ PYBIND11_MODULE(_pooling, m) {
           py::arg("mapping") = 0);
 
     m.def("avgpool2d_f16", &avgpool2d_f16,
+          py::arg("input"),
+          py::arg("kernel_size"),
+          py::arg("stride") = py::none(),
+          py::arg("padding") = 0,
+          py::arg("dilation") = 1,
+          py::arg("ceil_mode") = true,
+          py::arg("count_include_pad") = true,
+          py::arg("divisor_override") = py::none(),
+          py::arg("version") = 0,
+          py::arg("mapping") = 0);
+
+    // CUDA synchronize
+    m.def("cuda_synchronize", &cuda_synchronize,
+          "Synchronize the CUDA device");
+
+    // Timed variants (return (output, elapsed_ms) tuple)
+    m.def("maxpool2d_timed_f32", &maxpool2d_timed_f32,
+          py::arg("input"),
+          py::arg("kernel_size"),
+          py::arg("stride") = py::none(),
+          py::arg("padding") = 0,
+          py::arg("dilation") = 1,
+          py::arg("ceil_mode") = false,
+          py::arg("version") = 0,
+          py::arg("mapping") = 0);
+
+    m.def("maxpool2d_timed_f16", &maxpool2d_timed_f16,
+          py::arg("input"),
+          py::arg("kernel_size"),
+          py::arg("stride") = py::none(),
+          py::arg("padding") = 0,
+          py::arg("dilation") = 1,
+          py::arg("ceil_mode") = false,
+          py::arg("version") = 0,
+          py::arg("mapping") = 0);
+
+    m.def("avgpool2d_timed_f32", &avgpool2d_timed_f32,
+          py::arg("input"),
+          py::arg("kernel_size"),
+          py::arg("stride") = py::none(),
+          py::arg("padding") = 0,
+          py::arg("dilation") = 1,
+          py::arg("ceil_mode") = true,
+          py::arg("count_include_pad") = true,
+          py::arg("divisor_override") = py::none(),
+          py::arg("version") = 0,
+          py::arg("mapping") = 0);
+
+    m.def("avgpool2d_timed_f16", &avgpool2d_timed_f16,
           py::arg("input"),
           py::arg("kernel_size"),
           py::arg("stride") = py::none(),
