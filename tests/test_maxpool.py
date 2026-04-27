@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from conftest import (
     pytorch_maxpool2d, call_maxpool2d, check_close,
-    MAXPOOL_VERSIONS, TOLERANCES,
+    MAXPOOL_VERSIONS, TOLERANCES, MAPPING_VERSIONS,
 )
 
 
@@ -169,4 +169,64 @@ def test_large_batch(version, dtype):
     x = _rand_nhwc(8, 8, 8, 3, dtype)
     expected = pytorch_maxpool2d(x, 2, 2, 0, 1, False)
     actual = call_maxpool2d(x, 2, 2, 0, 1, False, version)
+    check_close(actual, expected, dtype)
+
+
+# ---------- v7 mapping-specific tests ----------
+
+@pytest.mark.parametrize("mapping", MAPPING_VERSIONS)
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+@pytest.mark.parametrize("kernel_size", [2, 3, (3, 2)])
+@pytest.mark.parametrize("stride,padding", [(1, 0), (2, 0), (2, 1)])
+def test_v7_mapping_basic(mapping, dtype, kernel_size, stride, padding):
+    x = _rand_nhwc(2, 32, 32, 8, dtype)
+    expected = pytorch_maxpool2d(x, kernel_size, stride, padding, 1, False)
+    actual = call_maxpool2d(x, kernel_size, stride, padding, 1, False, version=7, mapping=mapping)
+    check_close(actual, expected, dtype)
+
+
+@pytest.mark.parametrize("mapping", MAPPING_VERSIONS)
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_v7_mapping_ceil_mode(mapping, dtype):
+    x = _rand_nhwc(2, 7, 7, 4, dtype)
+    expected = pytorch_maxpool2d(x, 3, 2, 1, 1, True)
+    actual = call_maxpool2d(x, 3, 2, 1, 1, True, version=7, mapping=mapping)
+    check_close(actual, expected, dtype)
+
+
+@pytest.mark.parametrize("mapping", MAPPING_VERSIONS)
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_v7_mapping_dilation(mapping, dtype):
+    x = _rand_nhwc(2, 32, 32, 8, dtype)
+    expected = pytorch_maxpool2d(x, 3, 2, 1, 2, False)
+    actual = call_maxpool2d(x, 3, 2, 1, 2, False, version=7, mapping=mapping)
+    check_close(actual, expected, dtype)
+
+
+@pytest.mark.parametrize("mapping", MAPPING_VERSIONS)
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_v7_mapping_nonsquare(mapping, dtype):
+    x = _rand_nhwc(2, 16, 20, 8, dtype)
+    expected = pytorch_maxpool2d(x, (3, 5), (2, 3), (1, 2), 1, False)
+    actual = call_maxpool2d(x, (3, 5), (2, 3), (1, 2), 1, False, version=7, mapping=mapping)
+    check_close(actual, expected, dtype)
+
+
+@pytest.mark.parametrize("mapping", MAPPING_VERSIONS)
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_v7_mapping_large_C(mapping, dtype):
+    """Test with larger channel count to exercise mapping C and D."""
+    x = _rand_nhwc(1, 8, 8, 64, dtype)
+    expected = pytorch_maxpool2d(x, 2, 2, 0, 1, False)
+    actual = call_maxpool2d(x, 2, 2, 0, 1, False, version=7, mapping=mapping)
+    check_close(actual, expected, dtype)
+
+
+@pytest.mark.parametrize("mapping", MAPPING_VERSIONS)
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_v7_mapping_odd_C(mapping, dtype):
+    """Test with odd C — mapping D should fall back to A."""
+    x = _rand_nhwc(1, 8, 8, 3, dtype)
+    expected = pytorch_maxpool2d(x, 2, 2, 0, 1, False)
+    actual = call_maxpool2d(x, 2, 2, 0, 1, False, version=7, mapping=mapping)
     check_close(actual, expected, dtype)

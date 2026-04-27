@@ -1314,3 +1314,369 @@ void avgpool_v6(const half* input, half* output, const AvgPoolParams& params, cu
         input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ============================================================================
+// AvgPool2d v7: alternative grid/block mappings
+// mapping=0 (A): 1D flat — same as v0
+// mapping=1 (B): 2D spatial tiling — blockDim(8,8,4)
+// mapping=2 (C): channel-major — blockDim(256,1,1), grid(OW,OH,N*ceil(C/256))
+// mapping=3 (D): hybrid warp-spatial + vectorized — blockDim(32,8,1)
+// Falls back to mapping A for alignment issues (e.g., C%4!=0 for D)
+// or when grid dimensions exceed CUDA limits.
+// ============================================================================
+
+// --- Mapping B: 2D Spatial ---
+// Each block covers an 8x8 spatial tile with 4 channels per thread
+// blockDim = (8, 8, 4) = 256 threads
+// Grid: (ceil(OW/8), ceil(OH/8), N * ceil(C/4))
+// Thread (tx, ty, tz): oh = blockIdx.y*8+ty, ow = blockIdx.x*8+tx, c = c_group*4+tz
+
+template <typename T>
+__global__ void avgpool_v7_mappingB_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const AvgPoolParams params,
+    int C_groups)
+{
+    const int n = blockIdx.z / C_groups;
+    const int c_group = blockIdx.z - n * C_groups;
+    const int c = c_group * 4 + threadIdx.z;
+    const int oh = blockIdx.y * 8 + threadIdx.y;
+    const int ow = blockIdx.x * 8 + threadIdx.x;
+
+    if (n >= params.N || oh >= params.OH || ow >= params.OW || c >= params.C) return;
+
+    float sum = 0.0f;
+    int count = 0;
+
+    for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+        const int64_t ih = oh * params.sh - params.ph + static_cast<int64_t>(kh_i) * params.dh;
+        const bool ih_in = (ih >= 0 && ih < params.H);
+        for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+            const int64_t iw = ow * params.sw - params.pw + static_cast<int64_t>(kw_i) * params.dw;
+            const bool iw_in = (iw >= 0 && iw < params.W);
+
+            if (ih_in && iw_in) {
+                const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c;
+                sum += static_cast<float>(input[in_idx]);
+                count++;
+            } else if (params.count_include_pad) {
+                const bool ih_in_pad = (ih >= -static_cast<int64_t>(params.ph) &&
+                                        ih < params.H + static_cast<int64_t>(params.ph));
+                const bool iw_in_pad = (iw >= -static_cast<int64_t>(params.pw) &&
+                                        iw < params.W + static_cast<int64_t>(params.pw));
+                if (ih_in_pad && iw_in_pad) {
+                    count++;
+                }
+            }
+        }
+    }
+
+    float divisor;
+    if (params.divisor_override > 0) {
+        divisor = static_cast<float>(params.divisor_override);
+    } else {
+        divisor = static_cast<float>(count);
+    }
+
+    const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c;
+    output[out_idx] = static_cast<T>((divisor > 0.0f) ? (sum / divisor) : 0.0f);
+}
+
+// --- Mapping C: Channel-Major ---
+// Each block covers 256 channels for one (oh, ow) position
+// blockDim = (256, 1, 1)
+// Grid: (OW, OH, N * ceil(C/256))
+// Thread: c = c_group*256 + threadIdx.x, ow = blockIdx.x, oh = blockIdx.y
+
+template <typename T>
+__global__ void avgpool_v7_mappingC_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const AvgPoolParams params,
+    int C_groups)
+{
+    const int n = blockIdx.z / C_groups;
+    const int c_group = blockIdx.z - n * C_groups;
+    const int c = c_group * 256 + threadIdx.x;
+    const int oh = blockIdx.y;
+    const int ow = blockIdx.x;
+
+    if (n >= params.N || oh >= params.OH || ow >= params.OW || c >= params.C) return;
+
+    float sum = 0.0f;
+    int count = 0;
+
+    for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+        const int64_t ih = oh * params.sh - params.ph + static_cast<int64_t>(kh_i) * params.dh;
+        const bool ih_in = (ih >= 0 && ih < params.H);
+        for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+            const int64_t iw = ow * params.sw - params.pw + static_cast<int64_t>(kw_i) * params.dw;
+            const bool iw_in = (iw >= 0 && iw < params.W);
+
+            if (ih_in && iw_in) {
+                const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c;
+                sum += static_cast<float>(input[in_idx]);
+                count++;
+            } else if (params.count_include_pad) {
+                const bool ih_in_pad = (ih >= -static_cast<int64_t>(params.ph) &&
+                                        ih < params.H + static_cast<int64_t>(params.ph));
+                const bool iw_in_pad = (iw >= -static_cast<int64_t>(params.pw) &&
+                                        iw < params.W + static_cast<int64_t>(params.pw));
+                if (ih_in_pad && iw_in_pad) {
+                    count++;
+                }
+            }
+        }
+    }
+
+    float divisor;
+    if (params.divisor_override > 0) {
+        divisor = static_cast<float>(params.divisor_override);
+    } else {
+        divisor = static_cast<float>(count);
+    }
+
+    const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c;
+    output[out_idx] = static_cast<T>((divisor > 0.0f) ? (sum / divisor) : 0.0f);
+}
+
+// --- Mapping D: Hybrid warp-spatial + channel-vectorized ---
+// Each warp handles a 4x4 spatial tile with 4 channels via vectorized loads
+// blockDim = (32, 8, 1) — 8 warps per block, each warp covers 4x4 spatial + 4 channels
+// Grid: (ceil(OW/4), ceil(OH/4), N * ceil(C/32))
+// Lanes 0-15 of each warp handle 4x4 spatial positions, loading 4 channels via float4/half2x2
+
+template <typename T>
+__global__ void avgpool_v7_mappingD_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const AvgPoolParams params,
+    int C_groups)
+{
+    const int n = blockIdx.z / C_groups;
+    const int c_group = blockIdx.z - n * C_groups;
+    const int c_block_base = c_group * 32;
+    const int warp_id = threadIdx.y;  // 0..7
+    const int lane = threadIdx.x;     // 0..31
+
+    const int oh_tile_base = blockIdx.y * 4;
+    const int ow_tile_base = blockIdx.x * 4;
+
+    // Each warp handles 4 channels
+    const int c_warp_base = c_block_base + warp_id * 4;
+    if (n >= params.N || c_warp_base + 3 >= params.C) return;
+
+    // Only first 16 lanes are active (4x4 = 16 spatial positions)
+    if (lane >= 16) return;
+
+    const int sh = lane / 4;
+    const int sw = lane % 4;
+    const int oh = oh_tile_base + sh;
+    const int ow = ow_tile_base + sw;
+    if (oh >= params.OH || ow >= params.OW) return;
+
+    float sum[4];
+    int count = 0;
+    #pragma unroll
+    for (int v = 0; v < 4; ++v)
+        sum[v] = 0.0f;
+
+    for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+        const int64_t ih = oh * params.sh - params.ph + static_cast<int64_t>(kh_i) * params.dh;
+        const bool ih_in = (ih >= 0 && ih < params.H);
+        for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+            const int64_t iw = ow * params.sw - params.pw + static_cast<int64_t>(kw_i) * params.dw;
+            const bool iw_in = (iw >= 0 && iw < params.W);
+
+            if (ih_in && iw_in) {
+                const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c_warp_base;
+
+                // Vectorized load of 4 channels
+                if constexpr (std::is_same_v<T, float>) {
+                    float4 vec = *reinterpret_cast<const float4*>(&input[in_idx]);
+                    sum[0] += vec.x;
+                    sum[1] += vec.y;
+                    sum[2] += vec.z;
+                    sum[3] += vec.w;
+                } else {
+                    half2 vec0 = *reinterpret_cast<const half2*>(&input[in_idx]);
+                    half2 vec1 = *reinterpret_cast<const half2*>(&input[in_idx + 2]);
+                    sum[0] += __low2float(vec0);
+                    sum[1] += __high2float(vec0);
+                    sum[2] += __low2float(vec1);
+                    sum[3] += __high2float(vec1);
+                }
+                count++;
+            } else if (params.count_include_pad) {
+                const bool ih_in_pad = (ih >= -static_cast<int64_t>(params.ph) &&
+                                        ih < params.H + static_cast<int64_t>(params.ph));
+                const bool iw_in_pad = (iw >= -static_cast<int64_t>(params.pw) &&
+                                        iw < params.W + static_cast<int64_t>(params.pw));
+                if (ih_in_pad && iw_in_pad) {
+                    count++;
+                }
+            }
+        }
+    }
+
+    float divisor;
+    if (params.divisor_override > 0) {
+        divisor = static_cast<float>(params.divisor_override);
+    } else {
+        divisor = static_cast<float>(count);
+    }
+
+    // Write 4 output values
+    const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c_warp_base;
+
+    if constexpr (std::is_same_v<T, float>) {
+        float4 out_vec;
+        out_vec.x = (divisor > 0.0f) ? (sum[0] / divisor) : 0.0f;
+        out_vec.y = (divisor > 0.0f) ? (sum[1] / divisor) : 0.0f;
+        out_vec.z = (divisor > 0.0f) ? (sum[2] / divisor) : 0.0f;
+        out_vec.w = (divisor > 0.0f) ? (sum[3] / divisor) : 0.0f;
+        *reinterpret_cast<float4*>(&output[out_idx]) = out_vec;
+    } else {
+        float r0 = (divisor > 0.0f) ? (sum[0] / divisor) : 0.0f;
+        float r1 = (divisor > 0.0f) ? (sum[1] / divisor) : 0.0f;
+        float r2 = (divisor > 0.0f) ? (sum[2] / divisor) : 0.0f;
+        float r3 = (divisor > 0.0f) ? (sum[3] / divisor) : 0.0f;
+        half2 out0 = __floats2half2_rn(r0, r1);
+        half2 out1 = __floats2half2_rn(r2, r3);
+        *reinterpret_cast<half2*>(&output[out_idx]) = out0;
+        *reinterpret_cast<half2*>(&output[out_idx + 2]) = out1;
+    }
+}
+
+// --- v7 launcher: dispatches to the appropriate mapping kernel ---
+
+void avgpool_v7(const float* input, float* output, const AvgPoolParams& params, int mapping, cudaStream_t stream) {
+    switch (mapping) {
+        case 0: {
+            // Mapping A: 1D flat — same as v0
+            avgpool_v0(input, output, params, stream);
+            break;
+        }
+        case 1: {
+            // Mapping B: 2D spatial tiling
+            const int C_groups = static_cast<int>((params.C + 3) / 4);
+            const int64_t grid_z_64 = params.N * C_groups;
+            if (grid_z_64 > 65535) {
+                avgpool_v0(input, output, params, stream);
+                break;
+            }
+            dim3 block(8, 8, 4);
+            dim3 grid(
+                static_cast<int>((params.OW + 7) / 8),
+                static_cast<int>((params.OH + 7) / 8),
+                static_cast<int>(grid_z_64));
+            avgpool_v7_mappingB_kernel<float><<<grid, block, 0, stream>>>(input, output, params, C_groups);
+            CUDA_CHECK(cudaGetLastError());
+            break;
+        }
+        case 2: {
+            // Mapping C: channel-major
+            const int C_groups = static_cast<int>((params.C + 255) / 256);
+            const int64_t grid_z_64 = params.N * C_groups;
+            if (params.OW > 65535 || params.OH > 65535 || grid_z_64 > 65535) {
+                avgpool_v0(input, output, params, stream);
+                break;
+            }
+            dim3 block(256, 1, 1);
+            dim3 grid(
+                static_cast<int>(params.OW),
+                static_cast<int>(params.OH),
+                static_cast<int>(grid_z_64));
+            avgpool_v7_mappingC_kernel<float><<<grid, block, 0, stream>>>(input, output, params, C_groups);
+            CUDA_CHECK(cudaGetLastError());
+            break;
+        }
+        case 3: {
+            // Mapping D: hybrid warp-spatial + vectorized
+            if (params.C % 4 != 0) {
+                avgpool_v0(input, output, params, stream);
+                break;
+            }
+            const int C_groups = static_cast<int>((params.C + 31) / 32);
+            const int64_t grid_z_64 = params.N * C_groups;
+            if (grid_z_64 > 65535) {
+                avgpool_v0(input, output, params, stream);
+                break;
+            }
+            dim3 block(32, 8, 1);
+            dim3 grid(
+                static_cast<int>((params.OW + 3) / 4),
+                static_cast<int>((params.OH + 3) / 4),
+                static_cast<int>(grid_z_64));
+            avgpool_v7_mappingD_kernel<float><<<grid, block, 0, stream>>>(input, output, params, C_groups);
+            CUDA_CHECK(cudaGetLastError());
+            break;
+        }
+        default:
+            throw std::invalid_argument("unsupported mapping: " + std::to_string(mapping));
+    }
+}
+
+void avgpool_v7(const half* input, half* output, const AvgPoolParams& params, int mapping, cudaStream_t stream) {
+    switch (mapping) {
+        case 0: {
+            avgpool_v0(input, output, params, stream);
+            break;
+        }
+        case 1: {
+            const int C_groups = static_cast<int>((params.C + 3) / 4);
+            const int64_t grid_z_64 = params.N * C_groups;
+            if (grid_z_64 > 65535) {
+                avgpool_v0(input, output, params, stream);
+                break;
+            }
+            dim3 block(8, 8, 4);
+            dim3 grid(
+                static_cast<int>((params.OW + 7) / 8),
+                static_cast<int>((params.OH + 7) / 8),
+                static_cast<int>(grid_z_64));
+            avgpool_v7_mappingB_kernel<half><<<grid, block, 0, stream>>>(input, output, params, C_groups);
+            CUDA_CHECK(cudaGetLastError());
+            break;
+        }
+        case 2: {
+            const int C_groups = static_cast<int>((params.C + 255) / 256);
+            const int64_t grid_z_64 = params.N * C_groups;
+            if (params.OW > 65535 || params.OH > 65535 || grid_z_64 > 65535) {
+                avgpool_v0(input, output, params, stream);
+                break;
+            }
+            dim3 block(256, 1, 1);
+            dim3 grid(
+                static_cast<int>(params.OW),
+                static_cast<int>(params.OH),
+                static_cast<int>(grid_z_64));
+            avgpool_v7_mappingC_kernel<half><<<grid, block, 0, stream>>>(input, output, params, C_groups);
+            CUDA_CHECK(cudaGetLastError());
+            break;
+        }
+        case 3: {
+            if (params.C % 4 != 0) {
+                avgpool_v0(input, output, params, stream);
+                break;
+            }
+            const int C_groups = static_cast<int>((params.C + 31) / 32);
+            const int64_t grid_z_64 = params.N * C_groups;
+            if (grid_z_64 > 65535) {
+                avgpool_v0(input, output, params, stream);
+                break;
+            }
+            dim3 block(32, 8, 1);
+            dim3 grid(
+                static_cast<int>((params.OW + 3) / 4),
+                static_cast<int>((params.OH + 3) / 4),
+                static_cast<int>(grid_z_64));
+            avgpool_v7_mappingD_kernel<half><<<grid, block, 0, stream>>>(input, output, params, C_groups);
+            CUDA_CHECK(cudaGetLastError());
+            break;
+        }
+        default:
+            throw std::invalid_argument("unsupported mapping: " + std::to_string(mapping));
+    }
+}

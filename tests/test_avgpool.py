@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from conftest import (
     pytorch_avgpool2d, call_avgpool2d, check_close,
-    AVGPOOL_VERSIONS, TOLERANCES,
+    AVGPOOL_VERSIONS, TOLERANCES, MAPPING_VERSIONS,
 )
 
 
@@ -212,4 +212,66 @@ def test_large_batch(version, dtype):
     x = _rand_nhwc(8, 8, 8, 3, dtype)
     expected = pytorch_avgpool2d(x, 2, 2, 0, False, True, None)
     actual = call_avgpool2d(x, 2, 2, 0, False, True, None, version)
+    check_close(actual, expected, dtype)
+
+
+# ---------- v7 mapping-specific tests ----------
+
+@pytest.mark.parametrize("mapping", MAPPING_VERSIONS)
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+@pytest.mark.parametrize("kernel_size", [2, 3, (3, 2)])
+@pytest.mark.parametrize("stride,padding", [(1, 0), (2, 0), (2, 1)])
+@pytest.mark.parametrize("count_include_pad", [True, False])
+def test_v7_mapping_basic(mapping, dtype, kernel_size, stride, padding, count_include_pad):
+    x = _rand_nhwc(2, 16, 16, 8, dtype)
+    expected = pytorch_avgpool2d(x, kernel_size, stride, padding, False, count_include_pad, None)
+    actual = call_avgpool2d(x, kernel_size, stride, padding, False, count_include_pad, None, version=7, mapping=mapping)
+    check_close(actual, expected, dtype)
+
+
+@pytest.mark.parametrize("mapping", MAPPING_VERSIONS)
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_v7_mapping_ceil_mode(mapping, dtype):
+    x = _rand_nhwc(2, 7, 7, 4, dtype)
+    expected = pytorch_avgpool2d(x, 3, 2, 1, True, True, None)
+    actual = call_avgpool2d(x, 3, 2, 1, True, True, None, version=7, mapping=mapping)
+    check_close(actual, expected, dtype)
+
+
+@pytest.mark.parametrize("mapping", MAPPING_VERSIONS)
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+@pytest.mark.parametrize("divisor_override", [1, 6, 9])
+def test_v7_mapping_divisor_override(mapping, dtype, divisor_override):
+    x = _rand_nhwc(2, 8, 8, 8, dtype)
+    expected = pytorch_avgpool2d(x, 3, 2, 1, False, True, divisor_override)
+    actual = call_avgpool2d(x, 3, 2, 1, False, True, divisor_override, version=7, mapping=mapping)
+    check_close(actual, expected, dtype)
+
+
+@pytest.mark.parametrize("mapping", MAPPING_VERSIONS)
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_v7_mapping_nonsquare(mapping, dtype):
+    x = _rand_nhwc(2, 16, 20, 8, dtype)
+    expected = pytorch_avgpool2d(x, (3, 5), (2, 3), (1, 2), False, True, None)
+    actual = call_avgpool2d(x, (3, 5), (2, 3), (1, 2), False, True, None, version=7, mapping=mapping)
+    check_close(actual, expected, dtype)
+
+
+@pytest.mark.parametrize("mapping", MAPPING_VERSIONS)
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_v7_mapping_large_C(mapping, dtype):
+    """Test with larger channel count to exercise mapping C and D."""
+    x = _rand_nhwc(1, 8, 8, 64, dtype)
+    expected = pytorch_avgpool2d(x, 2, 2, 0, False, True, None)
+    actual = call_avgpool2d(x, 2, 2, 0, False, True, None, version=7, mapping=mapping)
+    check_close(actual, expected, dtype)
+
+
+@pytest.mark.parametrize("mapping", MAPPING_VERSIONS)
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_v7_mapping_odd_C(mapping, dtype):
+    """Test with odd C -- mapping D should fall back to A."""
+    x = _rand_nhwc(1, 8, 8, 3, dtype)
+    expected = pytorch_avgpool2d(x, 2, 2, 0, False, True, None)
+    actual = call_avgpool2d(x, 2, 2, 0, False, True, None, version=7, mapping=mapping)
     check_close(actual, expected, dtype)

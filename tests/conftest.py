@@ -12,8 +12,9 @@ TOLERANCES = {
     np.float16: 1e-3,
 }
 
-MAXPOOL_VERSIONS = [0, 1, 2, 3, 4, 5, 6]
-AVGPOOL_VERSIONS = [0, 1, 2, 3, 4, 5, 6]
+MAXPOOL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 7]
+AVGPOOL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 7]
+MAPPING_VERSIONS = [0, 1, 2, 3]
 
 
 def _is_valid_maxpool_padding(kernel_size, padding, dilation):
@@ -81,25 +82,25 @@ def pytorch_avgpool2d(x_nhwc, kernel_size, stride, padding, ceil_mode, count_inc
     return np.ascontiguousarray(out_np.transpose(0, 2, 3, 1))
 
 
-def call_maxpool2d(x_nhwc, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False, version=0):
+def call_maxpool2d(x_nhwc, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False, version=0, mapping=0):
     """Call our CUDA maxpool2d."""
     dtype = x_nhwc.dtype
     if dtype == np.float16:
-        return _pooling.maxpool2d_f16(x_nhwc, kernel_size, stride, padding, dilation, ceil_mode, version)
+        return _pooling.maxpool2d_f16(x_nhwc, kernel_size, stride, padding, dilation, ceil_mode, version, mapping)
     else:
-        return _pooling.maxpool2d_f32(x_nhwc, kernel_size, stride, padding, dilation, ceil_mode, version)
+        return _pooling.maxpool2d_f32(x_nhwc, kernel_size, stride, padding, dilation, ceil_mode, version, mapping)
 
 
 def call_avgpool2d(x_nhwc, kernel_size, stride=None, padding=0, ceil_mode=True,
-                   count_include_pad=True, divisor_override=None, version=0):
+                   count_include_pad=True, divisor_override=None, version=0, mapping=0):
     """Call our CUDA avgpool2d."""
     dtype = x_nhwc.dtype
     if dtype == np.float16:
         return _pooling.avgpool2d_f16(x_nhwc, kernel_size, stride, padding, 1, ceil_mode,
-                                      count_include_pad, divisor_override, version)
+                                      count_include_pad, divisor_override, version, mapping)
     else:
         return _pooling.avgpool2d_f32(x_nhwc, kernel_size, stride, padding, 1, ceil_mode,
-                                      count_include_pad, divisor_override, version)
+                                      count_include_pad, divisor_override, version, mapping)
 
 
 def check_close(actual, expected, dtype):

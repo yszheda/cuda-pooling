@@ -76,7 +76,8 @@ py::array_t<float> maxpool2d_f32(
     const py::object& padding,
     const py::object& dilation,
     bool ceil_mode,
-    int version)
+    int version,
+    int mapping)
 {
     auto buf = input.request();
     if (buf.ndim != 4)
@@ -121,6 +122,9 @@ py::array_t<float> maxpool2d_f32(
         case 6:
             maxpool_v6(d_input, d_output, params, 0);
             break;
+        case 7:
+            maxpool_v7(d_input, d_output, params, mapping, 0);
+            break;
         default:
             CUDA_CHECK(cudaFree(d_input));
             CUDA_CHECK(cudaFree(d_output));
@@ -147,7 +151,8 @@ py::array maxpool2d_f16(
     const py::object& padding,
     const py::object& dilation,
     bool ceil_mode,
-    int version)
+    int version,
+    int mapping)
 {
     validate_float16(input);
     input = ensure_c_contiguous(input);
@@ -196,6 +201,9 @@ py::array maxpool2d_f16(
             break;
         case 6:
             maxpool_v6(d_input, d_output, params, 0);
+            break;
+        case 7:
+            maxpool_v7(d_input, d_output, params, mapping, 0);
             break;
         default:
             CUDA_CHECK(cudaFree(d_input));
@@ -248,7 +256,8 @@ py::array_t<float> avgpool2d_f32(
     bool ceil_mode,
     bool count_include_pad,
     const py::object& divisor_override,
-    int version)
+    int version,
+    int mapping)
 {
     auto buf = input.request();
     if (buf.ndim != 4)
@@ -295,6 +304,9 @@ py::array_t<float> avgpool2d_f32(
         case 6:
             avgpool_v6(d_input, d_output, params, 0);
             break;
+        case 7:
+            avgpool_v7(d_input, d_output, params, mapping, 0);
+            break;
         default:
             CUDA_CHECK(cudaFree(d_input));
             CUDA_CHECK(cudaFree(d_output));
@@ -321,7 +333,8 @@ py::array avgpool2d_f16(
     bool ceil_mode,
     bool count_include_pad,
     const py::object& divisor_override,
-    int version)
+    int version,
+    int mapping)
 {
     validate_float16(input);
     input = ensure_c_contiguous(input);
@@ -373,6 +386,9 @@ py::array avgpool2d_f16(
         case 6:
             avgpool_v6(d_input, d_output, params, 0);
             break;
+        case 7:
+            avgpool_v7(d_input, d_output, params, mapping, 0);
+            break;
         default:
             CUDA_CHECK(cudaFree(d_input));
             CUDA_CHECK(cudaFree(d_output));
@@ -402,7 +418,8 @@ PYBIND11_MODULE(_pooling, m) {
           py::arg("padding") = 0,
           py::arg("dilation") = 1,
           py::arg("ceil_mode") = false,
-          py::arg("version") = 0);
+          py::arg("version") = 0,
+          py::arg("mapping") = 0);
 
     m.def("maxpool2d_f16", &maxpool2d_f16,
           py::arg("input"),
@@ -411,7 +428,8 @@ PYBIND11_MODULE(_pooling, m) {
           py::arg("padding") = 0,
           py::arg("dilation") = 1,
           py::arg("ceil_mode") = false,
-          py::arg("version") = 0);
+          py::arg("version") = 0,
+          py::arg("mapping") = 0);
 
     m.def("avgpool2d_f32", &avgpool2d_f32,
           py::arg("input"),
@@ -422,7 +440,8 @@ PYBIND11_MODULE(_pooling, m) {
           py::arg("ceil_mode") = true,
           py::arg("count_include_pad") = true,
           py::arg("divisor_override") = py::none(),
-          py::arg("version") = 0);
+          py::arg("version") = 0,
+          py::arg("mapping") = 0);
 
     m.def("avgpool2d_f16", &avgpool2d_f16,
           py::arg("input"),
@@ -433,5 +452,6 @@ PYBIND11_MODULE(_pooling, m) {
           py::arg("ceil_mode") = true,
           py::arg("count_include_pad") = true,
           py::arg("divisor_override") = py::none(),
-          py::arg("version") = 0);
+          py::arg("version") = 0,
+          py::arg("mapping") = 0);
 }

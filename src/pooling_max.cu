@@ -1041,3 +1041,309 @@ void maxpool_v6(const half* input, half* output, const PoolParams& params, cudaS
         input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ============================================================================
+// MaxPool2d v7: alternative grid/block mappings
+// mapping=0 (A): 1D flat — same as v0
+// mapping=1 (B): 2D spatial tiling — blockDim(8,8,4)
+// mapping=2 (C): channel-major — blockDim(256,1,1), grid(OW,OH,N*ceil(C/256))
+// mapping=3 (D): hybrid warp-spatial + vectorized — blockDim(32,8,1)
+// Falls back to mapping A for alignment issues (e.g., C%4!=0 for D)
+// or when grid dimensions exceed CUDA limits.
+// ============================================================================
+
+// --- Mapping B: 2D Spatial ---
+// Each block covers an 8x8 spatial tile with 4 channels per thread
+// blockDim = (8, 8, 4) = 256 threads
+// Grid: (ceil(OW/8), ceil(OH/8), N * ceil(C/4))
+// Thread (tx, ty, tz): oh = blockIdx.y*8+ty, ow = blockIdx.x*8+tx, c = c_group*4+tz
+
+template <typename T>
+__global__ void maxpool_v7_mappingB_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const PoolParams params,
+    int C_groups)
+{
+    const int n = blockIdx.z / C_groups;
+    const int c_group = blockIdx.z - n * C_groups;
+    const int c = c_group * 4 + threadIdx.z;
+    const int oh = blockIdx.y * 8 + threadIdx.y;
+    const int ow = blockIdx.x * 8 + threadIdx.x;
+
+    if (n >= params.N || oh >= params.OH || ow >= params.OW || c >= params.C) return;
+
+    float maxval = -INFINITY;
+
+    for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+        const int64_t ih = oh * params.sh - params.ph + static_cast<int64_t>(kh_i) * params.dh;
+        if (ih < 0 || ih >= params.H) continue;
+        for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+            const int64_t iw = ow * params.sw - params.pw + static_cast<int64_t>(kw_i) * params.dw;
+            if (iw < 0 || iw >= params.W) continue;
+            const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c;
+            float val = static_cast<float>(input[in_idx]);
+            if (val > maxval) maxval = val;
+        }
+    }
+
+    const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c;
+    output[out_idx] = static_cast<T>(maxval);
+}
+
+// --- Mapping C: Channel-Major ---
+// Each block covers 256 channels for one (oh, ow) position
+// blockDim = (256, 1, 1)
+// Grid: (OW, OH, N * ceil(C/256))
+// Thread: c = c_group*256 + threadIdx.x, ow = blockIdx.x, oh = blockIdx.y
+
+template <typename T>
+__global__ void maxpool_v7_mappingC_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const PoolParams params,
+    int C_groups)
+{
+    const int n = blockIdx.z / C_groups;
+    const int c_group = blockIdx.z - n * C_groups;
+    const int c = c_group * 256 + threadIdx.x;
+    const int oh = blockIdx.y;
+    const int ow = blockIdx.x;
+
+    if (n >= params.N || oh >= params.OH || ow >= params.OW || c >= params.C) return;
+
+    float maxval = -INFINITY;
+
+    for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+        const int64_t ih = oh * params.sh - params.ph + static_cast<int64_t>(kh_i) * params.dh;
+        if (ih < 0 || ih >= params.H) continue;
+        for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+            const int64_t iw = ow * params.sw - params.pw + static_cast<int64_t>(kw_i) * params.dw;
+            if (iw < 0 || iw >= params.W) continue;
+            const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c;
+            float val = static_cast<float>(input[in_idx]);
+            if (val > maxval) maxval = val;
+        }
+    }
+
+    const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c;
+    output[out_idx] = static_cast<T>(maxval);
+}
+
+// --- Mapping D: Hybrid warp-spatial + channel-vectorized ---
+// Each warp handles a 4x4 spatial tile with 4 channels via vectorized loads
+// blockDim = (32, 8, 1) — 8 warps per block, each warp covers 4x4 spatial + 4 channels
+// Grid: (ceil(OW/4), ceil(OH/4), N * ceil(C/32))
+// Lanes 0-15 of each warp handle 4x4 spatial positions, loading 4 channels via float4/half2x2
+
+template <typename T>
+__global__ void maxpool_v7_mappingD_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const PoolParams params,
+    int C_groups)
+{
+    const int n = blockIdx.z / C_groups;
+    const int c_group = blockIdx.z - n * C_groups;
+    const int c_block_base = c_group * 32;
+    const int warp_id = threadIdx.y;  // 0..7
+    const int lane = threadIdx.x;     // 0..31
+
+    const int oh_tile_base = blockIdx.y * 4;
+    const int ow_tile_base = blockIdx.x * 4;
+
+    // Each warp handles 4 channels
+    const int c_warp_base = c_block_base + warp_id * 4;
+    if (n >= params.N || c_warp_base + 3 >= params.C) return;
+
+    // Only first 16 lanes are active (4x4 = 16 spatial positions)
+    if (lane >= 16) return;
+
+    const int sh = lane / 4;
+    const int sw = lane % 4;
+    const int oh = oh_tile_base + sh;
+    const int ow = ow_tile_base + sw;
+    if (oh >= params.OH || ow >= params.OW) return;
+
+    float maxval[4];
+    #pragma unroll
+    for (int v = 0; v < 4; ++v)
+        maxval[v] = -INFINITY;
+
+    for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+        const int64_t ih = oh * params.sh - params.ph + static_cast<int64_t>(kh_i) * params.dh;
+        if (ih < 0 || ih >= params.H) continue;
+        for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+            const int64_t iw = ow * params.sw - params.pw + static_cast<int64_t>(kw_i) * params.dw;
+            if (iw < 0 || iw >= params.W) continue;
+            const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c_warp_base;
+
+            // Vectorized load of 4 channels
+            if constexpr (std::is_same_v<T, float>) {
+                float4 vec = *reinterpret_cast<const float4*>(&input[in_idx]);
+                if (vec.x > maxval[0]) maxval[0] = vec.x;
+                if (vec.y > maxval[1]) maxval[1] = vec.y;
+                if (vec.z > maxval[2]) maxval[2] = vec.z;
+                if (vec.w > maxval[3]) maxval[3] = vec.w;
+            } else {
+                half2 vec0 = *reinterpret_cast<const half2*>(&input[in_idx]);
+                half2 vec1 = *reinterpret_cast<const half2*>(&input[in_idx + 2]);
+                float lo0 = __low2float(vec0), hi0 = __high2float(vec0);
+                float lo1 = __low2float(vec1), hi1 = __high2float(vec1);
+                if (lo0 > maxval[0]) maxval[0] = lo0;
+                if (hi0 > maxval[1]) maxval[1] = hi0;
+                if (lo1 > maxval[2]) maxval[2] = lo1;
+                if (hi1 > maxval[3]) maxval[3] = hi1;
+            }
+        }
+    }
+
+    // Write 4 output values
+    const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c_warp_base;
+
+    if constexpr (std::is_same_v<T, float>) {
+        float4 out_vec;
+        out_vec.x = maxval[0];
+        out_vec.y = maxval[1];
+        out_vec.z = maxval[2];
+        out_vec.w = maxval[3];
+        *reinterpret_cast<float4*>(&output[out_idx]) = out_vec;
+    } else {
+        half2 out0 = __floats2half2_rn(maxval[0], maxval[1]);
+        half2 out1 = __floats2half2_rn(maxval[2], maxval[3]);
+        *reinterpret_cast<half2*>(&output[out_idx]) = out0;
+        *reinterpret_cast<half2*>(&output[out_idx + 2]) = out1;
+    }
+}
+
+// --- v7 launcher: dispatches to the appropriate mapping kernel ---
+
+void maxpool_v7(const float* input, float* output, const PoolParams& params, int mapping, cudaStream_t stream) {
+    switch (mapping) {
+        case 0: {
+            // Mapping A: 1D flat — same as v0
+            maxpool_v0(input, output, params, stream);
+            break;
+        }
+        case 1: {
+            // Mapping B: 2D spatial tiling
+            const int C_groups = static_cast<int>((params.C + 3) / 4);
+            const int64_t grid_z_64 = params.N * C_groups;
+            if (grid_z_64 > 65535) {
+                maxpool_v0(input, output, params, stream);
+                break;
+            }
+            dim3 block(8, 8, 4);
+            dim3 grid(
+                static_cast<int>((params.OW + 7) / 8),
+                static_cast<int>((params.OH + 7) / 8),
+                static_cast<int>(grid_z_64));
+            maxpool_v7_mappingB_kernel<float><<<grid, block, 0, stream>>>(input, output, params, C_groups);
+            CUDA_CHECK(cudaGetLastError());
+            break;
+        }
+        case 2: {
+            // Mapping C: channel-major
+            const int C_groups = static_cast<int>((params.C + 255) / 256);
+            const int64_t grid_z_64 = params.N * C_groups;
+            if (params.OW > 65535 || params.OH > 65535 || grid_z_64 > 65535) {
+                maxpool_v0(input, output, params, stream);
+                break;
+            }
+            dim3 block(256, 1, 1);
+            dim3 grid(
+                static_cast<int>(params.OW),
+                static_cast<int>(params.OH),
+                static_cast<int>(grid_z_64));
+            maxpool_v7_mappingC_kernel<float><<<grid, block, 0, stream>>>(input, output, params, C_groups);
+            CUDA_CHECK(cudaGetLastError());
+            break;
+        }
+        case 3: {
+            // Mapping D: hybrid warp-spatial + vectorized
+            if (params.C % 4 != 0) {
+                maxpool_v0(input, output, params, stream);
+                break;
+            }
+            const int C_groups = static_cast<int>((params.C + 31) / 32);
+            const int64_t grid_z_64 = params.N * C_groups;
+            if (grid_z_64 > 65535) {
+                maxpool_v0(input, output, params, stream);
+                break;
+            }
+            dim3 block(32, 8, 1);
+            dim3 grid(
+                static_cast<int>((params.OW + 3) / 4),
+                static_cast<int>((params.OH + 3) / 4),
+                static_cast<int>(grid_z_64));
+            maxpool_v7_mappingD_kernel<float><<<grid, block, 0, stream>>>(input, output, params, C_groups);
+            CUDA_CHECK(cudaGetLastError());
+            break;
+        }
+        default:
+            throw std::invalid_argument("unsupported mapping: " + std::to_string(mapping));
+    }
+}
+
+void maxpool_v7(const half* input, half* output, const PoolParams& params, int mapping, cudaStream_t stream) {
+    switch (mapping) {
+        case 0: {
+            maxpool_v0(input, output, params, stream);
+            break;
+        }
+        case 1: {
+            const int C_groups = static_cast<int>((params.C + 3) / 4);
+            const int64_t grid_z_64 = params.N * C_groups;
+            if (grid_z_64 > 65535) {
+                maxpool_v0(input, output, params, stream);
+                break;
+            }
+            dim3 block(8, 8, 4);
+            dim3 grid(
+                static_cast<int>((params.OW + 7) / 8),
+                static_cast<int>((params.OH + 7) / 8),
+                static_cast<int>(grid_z_64));
+            maxpool_v7_mappingB_kernel<half><<<grid, block, 0, stream>>>(input, output, params, C_groups);
+            CUDA_CHECK(cudaGetLastError());
+            break;
+        }
+        case 2: {
+            const int C_groups = static_cast<int>((params.C + 255) / 256);
+            const int64_t grid_z_64 = params.N * C_groups;
+            if (params.OW > 65535 || params.OH > 65535 || grid_z_64 > 65535) {
+                maxpool_v0(input, output, params, stream);
+                break;
+            }
+            dim3 block(256, 1, 1);
+            dim3 grid(
+                static_cast<int>(params.OW),
+                static_cast<int>(params.OH),
+                static_cast<int>(grid_z_64));
+            maxpool_v7_mappingC_kernel<half><<<grid, block, 0, stream>>>(input, output, params, C_groups);
+            CUDA_CHECK(cudaGetLastError());
+            break;
+        }
+        case 3: {
+            if (params.C % 4 != 0) {
+                maxpool_v0(input, output, params, stream);
+                break;
+            }
+            const int C_groups = static_cast<int>((params.C + 31) / 32);
+            const int64_t grid_z_64 = params.N * C_groups;
+            if (grid_z_64 > 65535) {
+                maxpool_v0(input, output, params, stream);
+                break;
+            }
+            dim3 block(32, 8, 1);
+            dim3 grid(
+                static_cast<int>((params.OW + 3) / 4),
+                static_cast<int>((params.OH + 3) / 4),
+                static_cast<int>(grid_z_64));
+            maxpool_v7_mappingD_kernel<half><<<grid, block, 0, stream>>>(input, output, params, C_groups);
+            CUDA_CHECK(cudaGetLastError());
+            break;
+        }
+        default:
+            throw std::invalid_argument("unsupported mapping: " + std::to_string(mapping));
+    }
+}
