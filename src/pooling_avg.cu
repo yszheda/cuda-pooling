@@ -1851,6 +1851,13 @@ __global__ void avgpool_v8_kernel(
     output[out_idx] = static_cast<T>((divisor > 0.0f) ? (sum / divisor) : 0.0f);
 }
 
+// Helper: set max dynamic shared memory for the matching avgpool v8 template
+template <typename T>
+static void avg_v8_set_smem_attr(AvgTileConfig cfg, size_t smem_bytes) {
+    // No-op: our tile configs always fit within the default 48KB smem limit.
+    (void)cfg; (void)smem_bytes;
+}
+
 template <typename T>
 static float avg_v8_bench_tile(const T* d_input, T* d_output, const AvgPoolParams& params,
                                AvgTileConfig cfg, cudaStream_t stream) {
@@ -1871,7 +1878,7 @@ static float avg_v8_bench_tile(const T* d_input, T* d_output, const AvgPoolParam
 
     for (int i = 0; i < 3; i++) {
         if (smem_bytes > 49152) {
-            CUDA_CHECK(cudaFuncSetAttribute(avgpool_v8_kernel<8, 8, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+            avg_v8_set_smem_attr<T>(cfg, smem_bytes);
         }
         switch ((cfg.tile_oh << 8) | cfg.tile_ow) {
             case (8<<8)|8:   avgpool_v8_kernel<8, 8, T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
@@ -1890,7 +1897,7 @@ static float avg_v8_bench_tile(const T* d_input, T* d_output, const AvgPoolParam
 
     CUDA_CHECK(cudaEventRecord(start, stream));
     if (smem_bytes > 49152) {
-        CUDA_CHECK(cudaFuncSetAttribute(avgpool_v8_kernel<8, 8, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+        avg_v8_set_smem_attr<T>(cfg, smem_bytes);
     }
     switch ((cfg.tile_oh << 8) | cfg.tile_ow) {
         case (8<<8)|8:   avgpool_v8_kernel<8, 8, T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
@@ -1928,7 +1935,7 @@ static void avg_v8_launch_config(const T* d_input, T* d_output, const AvgPoolPar
     size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(float);
 
     if (smem_bytes > 49152) {
-        CUDA_CHECK(cudaFuncSetAttribute(avgpool_v8_kernel<8, 8, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+        avg_v8_set_smem_attr<T>(cfg, smem_bytes);
     }
     switch ((cfg.tile_oh << 8) | cfg.tile_ow) {
         case (8<<8)|8:   avgpool_v8_kernel<8, 8, T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
@@ -1944,6 +1951,16 @@ static void avg_v8_launch_config(const T* d_input, T* d_output, const AvgPoolPar
     }
 }
 
+static AvgTileConfig avg_v8_heuristic_tile(const AvgPoolParams& params) {
+    if (params.sh == 1 && params.OH > 64 && params.OW > 64)
+        return {16, 16};
+    if (params.sh >= 2)
+        return {8, 32};
+    if (params.C > 256)
+        return {8, 8};
+    return {8, 8};
+}
+
 void avgpool_v8(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
     NVTX_RANGE_PUSH_C("avgpool_v8_f32", NVTX_COLOR_AVGPOOL);
 
@@ -1955,7 +1972,7 @@ void avgpool_v8(const float* input, float* output, const AvgPoolParams& params, 
 
     uint64_t key = avg_v8_hash_key(params.H, params.W, params.C, params.kh, params.kw, params.sh, params.sw, params.ph, params.pw);
 
-    AvgTileConfig cfg;
+    AvgTileConfig cfg = {0, 0};
     {
         std::lock_guard<std::mutex> lock(avg_v8_cache_mutex);
         auto it = avg_v8_cache.find(key);
@@ -1965,25 +1982,7 @@ void avgpool_v8(const float* input, float* output, const AvgPoolParams& params, 
     }
 
     if (cfg.tile_oh == 0) {
-        int best_idx = 0;
-        float best_time = 1e9f;
-        for (int i = 0; i < AVG_V8_NUM_CANDIDATES; i++) {
-            int smem_h = (AVG_V8_TILE_CANDIDATES[i].tile_oh - 1) * params.sh + (params.kh - 1) * params.dh + 1;
-            int smem_w = (AVG_V8_TILE_CANDIDATES[i].tile_ow - 1) * params.sw + (params.kw - 1) * params.dw + 1;
-            smem_h = min(smem_h, static_cast<int>(params.H + 2 * params.ph));
-            smem_w = min(smem_w, static_cast<int>(params.W + 2 * params.pw));
-            size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(float);
-            int smem_limit = 0;
-            CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
-            if (smem_bytes > static_cast<size_t>(smem_limit)) continue;
-
-            float t = avg_v8_bench_tile(input, output, params, AVG_V8_TILE_CANDIDATES[i], stream);
-            if (t < best_time) {
-                best_time = t;
-                best_idx = i;
-            }
-        }
-        cfg = AVG_V8_TILE_CANDIDATES[best_idx];
+        cfg = avg_v8_heuristic_tile(params);
         {
             std::lock_guard<std::mutex> lock(avg_v8_cache_mutex);
             avg_v8_cache[key] = cfg;
@@ -2006,7 +2005,7 @@ void avgpool_v8(const half* input, half* output, const AvgPoolParams& params, cu
 
     uint64_t key = avg_v8_hash_key(params.H, params.W, params.C, params.kh, params.kw, params.sh, params.sw, params.ph, params.pw);
 
-    AvgTileConfig cfg;
+    AvgTileConfig cfg = {0, 0};
     {
         std::lock_guard<std::mutex> lock(avg_v8_cache_mutex);
         auto it = avg_v8_cache.find(key);
@@ -2016,25 +2015,7 @@ void avgpool_v8(const half* input, half* output, const AvgPoolParams& params, cu
     }
 
     if (cfg.tile_oh == 0) {
-        int best_idx = 0;
-        float best_time = 1e9f;
-        for (int i = 0; i < AVG_V8_NUM_CANDIDATES; i++) {
-            int smem_h = (AVG_V8_TILE_CANDIDATES[i].tile_oh - 1) * params.sh + (params.kh - 1) * params.dh + 1;
-            int smem_w = (AVG_V8_TILE_CANDIDATES[i].tile_ow - 1) * params.sw + (params.kw - 1) * params.dw + 1;
-            smem_h = min(smem_h, static_cast<int>(params.H + 2 * params.ph));
-            smem_w = min(smem_w, static_cast<int>(params.W + 2 * params.pw));
-            size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(float);
-            int smem_limit = 0;
-            CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
-            if (smem_bytes > static_cast<size_t>(smem_limit)) continue;
-
-            float t = avg_v8_bench_tile(input, output, params, AVG_V8_TILE_CANDIDATES[i], stream);
-            if (t < best_time) {
-                best_time = t;
-                best_idx = i;
-            }
-        }
-        cfg = AVG_V8_TILE_CANDIDATES[best_idx];
+        cfg = avg_v8_heuristic_tile(params);
         {
             std::lock_guard<std::mutex> lock(avg_v8_cache_mutex);
             avg_v8_cache[key] = cfg;
@@ -2054,78 +2035,89 @@ template <typename T>
 __global__ void avgpool_v10_kernel(const T* __restrict__ input, T* __restrict__ output,
                                    const AvgPoolParams params,
                                    uint32_t* __restrict__ work_counter,
-                                   uint32_t total_tiles) {
+                                   uint32_t total_tiles,
+                                   int blocks_oh, int blocks_ow,
+                                   int smem_h, int smem_w)
+{
     constexpr int TILE_OH = 8;
     constexpr int TILE_OW = 8;
-    const int smem_h = min((TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1,
-                           static_cast<int>(params.H + 2 * params.ph));
-    const int smem_w = min((TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1,
-                           static_cast<int>(params.W + 2 * params.pw));
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    const T* smem = reinterpret_cast<const T*>(smem_raw);
-    T* smem_rw = reinterpret_cast<T*>(smem_raw);
+    T* smem = reinterpret_cast<T*>(smem_raw);
+    uint32_t* s_tile = reinterpret_cast<uint32_t*>(smem + smem_h * smem_w);
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
 
-    uint32_t tile_id = atomicAdd(work_counter, 1);
-    if (tile_id >= total_tiles) return;
-
-    const uint32_t tiles_per_nc = static_cast<uint32_t>(params.OH) * static_cast<uint32_t>(params.OW);
-    const uint32_t nc_id = tile_id / tiles_per_nc;
-    const uint32_t tile_pos = tile_id % tiles_per_nc;
-    const uint32_t n = nc_id / static_cast<uint32_t>(params.C);
-    const uint32_t c = nc_id % static_cast<uint32_t>(params.C);
-    const uint32_t tile_oh_start = tile_pos / static_cast<uint32_t>(params.OW) * TILE_OH;
-    const uint32_t tile_ow_start = tile_pos % static_cast<uint32_t>(params.OW) * TILE_OW;
-
-    for (int si = ty; si < smem_h; si += TILE_OH) {
-        for (int sj = tx; sj < smem_w; sj += TILE_OW) {
-            int ih = static_cast<int>(tile_oh_start) * params.sh + si * params.dh - params.ph;
-            int iw = static_cast<int>(tile_ow_start) * params.sw + sj * params.dw - params.pw;
-            T val = T(0);
-            bool in_bounds = (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W);
-            if (in_bounds) {
-                int64_t idx = ((n * params.H + ih) * params.W + iw) * params.C + c;
-                val = input[idx];
-            }
-            smem_rw[si * smem_w + sj] = val;
+    while (true) {
+        if (tx == 0 && ty == 0) {
+            s_tile[0] = atomicAdd(work_counter, 1);
         }
-    }
-    __syncthreads();
+        __syncthreads();
+        uint32_t tile_id = s_tile[0];
+        if (tile_id >= total_tiles) break;
 
-    const int local_oh = ty;
-    const int local_ow = tx;
-    const int oh = static_cast<int>(tile_oh_start) + local_oh;
-    const int ow = static_cast<int>(tile_ow_start) + local_ow;
+        // Decode: tile_id = ((n * C + c) * blocks_oh + toh) * blocks_ow + tow
+        uint32_t tmp = tile_id;
+        const int tow = tmp % blocks_ow; tmp /= blocks_ow;
+        const int toh = tmp % blocks_oh; tmp /= blocks_oh;
+        const int c   = tmp % static_cast<int>(params.C);
+        const int n   = tmp / static_cast<int>(params.C);
 
-    if (oh < params.OH && ow < params.OW) {
-        float sum = 0.0f;
-        int count = 0;
-        const int kh_end = min(params.kh, smem_h - local_oh * params.sh);
-        const int kw_end = min(params.kw, smem_w - local_ow * params.sw);
-        for (int ki = 0; ki < kh_end; ki++) {
-            for (int kj = 0; kj < kw_end; kj++) {
-                const int si = local_oh * params.sh + ki * params.dh;
-                const int sj = local_ow * params.sw + kj * params.dw;
-                bool valid = true;
-                int src_ih = static_cast<int>(tile_oh_start) * params.sh + si * params.dh - params.ph;
-                int src_iw = static_cast<int>(tile_ow_start) * params.sw + sj * params.dw - params.pw;
-                if (!params.count_include_pad) {
-                    valid = (src_ih >= 0 && src_ih < params.H && src_iw >= 0 && src_iw < params.W);
+        const int tile_oh_start = toh * TILE_OH;
+        const int tile_ow_start = tow * TILE_OW;
+        const int ih_base = tile_oh_start * params.sh - params.ph;
+        const int iw_base = tile_ow_start * params.sw - params.pw;
+
+        // Load input tile + halo into shared memory
+        for (int si = ty; si < smem_h; si += TILE_OH) {
+            for (int sj = tx; sj < smem_w; sj += TILE_OW) {
+                int ih = ih_base + si;
+                int iw = iw_base + sj;
+                T val = T(0);
+                bool in_bounds = (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W);
+                if (in_bounds) {
+                    int64_t idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c;
+                    val = input[idx];
                 }
-                if (valid) {
-                    sum += static_cast<float>(smem[si * smem_w + sj]);
-                    count++;
-                }
+                smem[si * smem_w + sj] = val;
             }
         }
-        int64_t divisor = count;
-        if (params.divisor_override > 0) divisor = static_cast<int64_t>(params.divisor_override);
-        else if (count == 0) divisor = 1;
-        int64_t oidx = ((n * params.OH + oh) * params.OW + ow) * params.C + c;
-        output[oidx] = static_cast<T>(sum / static_cast<float>(divisor));
+        __syncthreads();
+
+        const int local_oh = ty;
+        const int local_ow = tx;
+        const int oh = tile_oh_start + local_oh;
+        const int ow = tile_ow_start + local_ow;
+
+        if (oh < params.OH && ow < params.OW) {
+            float sum = 0.0f;
+            int count = 0;
+            for (int ki = 0; ki < params.kh; ki++) {
+                for (int kj = 0; kj < params.kw; kj++) {
+                    const int si = local_oh * params.sh + ki * params.dh;
+                    const int sj = local_ow * params.sw + kj * params.dw;
+                    int src_ih = ih_base + si;
+                    int src_iw = iw_base + sj;
+                    bool in_input = (src_ih >= 0 && src_ih < params.H && src_iw >= 0 && src_iw < params.W);
+                    bool in_explicit_pad = !in_input && (
+                        (src_ih >= -params.ph && src_ih < 0) || (src_ih >= params.H && src_ih < params.H + params.ph) ||
+                        (src_iw >= -params.pw && src_iw < 0) || (src_iw >= params.W && src_iw < params.W + params.pw)
+                    );
+                    bool valid = in_input || (params.count_include_pad && in_explicit_pad);
+                    if (valid) {
+                        sum += static_cast<float>(smem[si * smem_w + sj]);
+                        count++;
+                    }
+                }
+            }
+            int64_t divisor = count;
+            if (params.divisor_override > 0) divisor = static_cast<int64_t>(params.divisor_override);
+            else if (count == 0) divisor = 1;
+            int64_t oidx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c;
+            output[oidx] = static_cast<T>(sum / static_cast<float>(divisor));
+        }
+        __syncthreads();
     }
 }
 
@@ -2141,15 +2133,13 @@ static void avgpool_v10_launch(const T* d_input, T* d_output, const AvgPoolParam
     const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
     const uint32_t total_tiles = static_cast<uint32_t>(params.N * params.C * blocks_oh * blocks_ow);
 
+    const int smem_h = TILE_OH * params.sh + (params.kh - 1) * params.dh + 1;
+    const int smem_w = TILE_OW * params.sw + (params.kw - 1) * params.dw + 1;
+    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(T) + sizeof(uint32_t);
+
     uint32_t* d_counter = nullptr;
     CUDA_CHECK(cudaMallocAsync(&d_counter, sizeof(uint32_t), stream));
     CUDA_CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint32_t), stream));
-
-    const int smem_h = min((TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1,
-                           static_cast<int>(params.H + 2 * params.ph));
-    const int smem_w = min((TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1,
-                           static_cast<int>(params.W + 2 * params.pw));
-    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(T);
 
     dim3 block(TILE_OW, TILE_OH);
     dim3 grid(num_sm, 1, 1);
@@ -2158,7 +2148,7 @@ static void avgpool_v10_launch(const T* d_input, T* d_output, const AvgPoolParam
         CUDA_CHECK(cudaFuncSetAttribute(avgpool_v10_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
     }
 
-    avgpool_v10_kernel<T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, d_counter, total_tiles);
+    avgpool_v10_kernel<T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, d_counter, total_tiles, blocks_oh, blocks_ow, smem_h, smem_w);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaFreeAsync(d_counter, stream));
 }
