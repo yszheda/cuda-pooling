@@ -2428,3 +2428,331 @@ void avgpool_v9(const half* input, half* output, const AvgPoolParams& params, cu
     CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
 }
+
+// ──────────────────────────────────────────────────────────────
+// v12: L2-Aware Spatial Persistent Kernel (AvgPool)
+// ──────────────────────────────────────────────────────────────
+
+template <typename T, int TILE_OH = 16, int TILE_OW = 16>
+__global__ void avgpool_v12_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                   const AvgPoolParams params,
+                                   int sm_tiles, int total_tiles)
+{
+    const int smem_h = TILE_OH * params.sh + (params.kh - 1) * params.dh + 1;
+    const int smem_w = TILE_OW * params.sw + (params.kw - 1) * params.dw + 1;
+
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    T* smem = reinterpret_cast<T*>(smem_raw);
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    int tile_offset = blockIdx.x * sm_tiles;
+    int tiles_remaining = sm_tiles;
+    if (tile_offset + tiles_remaining > total_tiles) {
+        tiles_remaining = total_tiles - tile_offset;
+    }
+
+    int blocks_oh = (params.OH + TILE_OH - 1) / TILE_OH;
+    int blocks_ow = (params.OW + TILE_OW - 1) / TILE_OW;
+
+    for (int local_idx = 0; local_idx < tiles_remaining; local_idx++) {
+        int tile_id = tile_offset + local_idx;
+
+        int tmp = tile_id;
+        int tow = tmp % blocks_ow; tmp /= blocks_ow;
+        int toh = tmp % blocks_oh; tmp /= blocks_oh;
+        int c = tmp % static_cast<int>(params.C);
+        int n = tmp / static_cast<int>(params.C);
+
+        int ih_base = toh * TILE_OH * params.sh - params.ph;
+        int iw_base = tow * TILE_OW * params.sw - params.pw;
+
+        // Load input tile + halo into shared memory
+        for (int si = ty; si < smem_h; si += TILE_OH) {
+            for (int sj = tx; sj < smem_w; sj += TILE_OW) {
+                int ih = ih_base + si;
+                int iw = iw_base + sj;
+                T val = T(0);
+                if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+                    int64_t idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c;
+                    val = input[idx];
+                }
+                smem[si * smem_w + sj] = val;
+            }
+        }
+        __syncthreads();
+
+        int local_oh = ty;
+        int local_ow = tx;
+        int oh = toh * TILE_OH + local_oh;
+        int ow = tow * TILE_OW + local_ow;
+
+        if (oh < params.OH && ow < params.OW) {
+            float sum = 0.0f;
+            int count = 0;
+            #pragma unroll
+            for (int ki = 0; ki < params.kh; ki++) {
+                #pragma unroll
+                for (int kj = 0; kj < params.kw; kj++) {
+                    int si = local_oh * params.sh + ki * params.dh;
+                    int sj = local_ow * params.sw + kj * params.dw;
+                    int src_ih = ih_base + si;
+                    int src_iw = iw_base + sj;
+                    bool in_input = (src_ih >= 0 && src_ih < params.H && src_iw >= 0 && src_iw < params.W);
+                    bool ih_in_pad = (src_ih >= -params.ph && src_ih < params.H + params.ph);
+                    bool iw_in_pad = (src_iw >= -params.pw && src_iw < params.W + params.pw);
+                    bool valid = in_input || (params.count_include_pad && ih_in_pad && iw_in_pad);
+                    if (valid) {
+                        sum += static_cast<float>(smem[si * smem_w + sj]);
+                        count++;
+                    }
+                }
+            }
+            int64_t divisor = count;
+            if (params.divisor_override > 0) divisor = static_cast<int64_t>(params.divisor_override);
+            else if (count == 0) divisor = 1;
+            int64_t oidx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c;
+            output[oidx] = static_cast<T>(sum / static_cast<float>(divisor));
+        }
+        __syncthreads();
+    }
+}
+
+template <typename T>
+static void avgpool_v12_launch(const T* d_input, T* d_output, const AvgPoolParams& params, cudaStream_t stream) {
+    constexpr int TILE_OH = 16;
+    constexpr int TILE_OW = 16;
+
+    int num_sm = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, 0));
+
+    int blocks_oh = (params.OH + TILE_OH - 1) / TILE_OH;
+    int blocks_ow = (params.OW + TILE_OW - 1) / TILE_OW;
+    int total_tiles = params.N * params.C * blocks_oh * blocks_ow;
+
+    int sm_tiles = (total_tiles + num_sm - 1) / num_sm;
+
+    int smem_h = TILE_OH * params.sh + (params.kh - 1) * params.dh + 1;
+    int smem_w = TILE_OW * params.sw + (params.kw - 1) * params.dw + 1;
+    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(T);
+
+    dim3 block(TILE_OW, TILE_OH);
+    dim3 grid(num_sm, 1, 1);
+
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(avgpool_v12_kernel<T, TILE_OH, TILE_OW>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+    }
+
+    avgpool_v12_kernel<T, TILE_OH, TILE_OW><<<grid, block, smem_bytes, stream>>>(
+        d_input, d_output, params, sm_tiles, total_tiles);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void avgpool_v12(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v12_f32", NVTX_COLOR_AVGPOOL);
+    avgpool_v12_launch(input, output, params, stream);
+    NVTX_RANGE_POP();
+}
+
+void avgpool_v12(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v12_f16", NVTX_COLOR_AVGPOOL);
+    avgpool_v12_launch(input, output, params, stream);
+    NVTX_RANGE_POP();
+}
+
+// ──────────────────────────────────────────────────────────────
+// v13: Channel-Vectorized Warp Kernel (AvgPool)
+// ──────────────────────────────────────────────────────────────
+
+template <typename T>
+__global__ void avgpool_v13_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                   const AvgPoolParams params)
+{
+    const int total_ow = params.OH * params.OW;
+    constexpr int VEC = (std::is_same_v<T, float>) ? 4 : 2;
+    const int C_vec = params.C / VEC;
+    const int total_work = params.N * C_vec * total_ow;
+
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    if (warp_id >= total_work) return;
+
+    int tmp = warp_id;
+    const int ow = tmp % params.OW; tmp /= params.OW;
+    const int oh = tmp % params.OH; tmp /= params.OH;
+    const int c_vec = tmp % C_vec;
+    const int n = tmp / C_vec;
+    const int c_base = c_vec * VEC;
+
+    const int lane = threadIdx.x % 32;
+    const int kh_start = oh * params.sh - params.ph;
+    const int kw_start = ow * params.sw - params.pw;
+
+    float sum[VEC];
+    int count[VEC];
+    #pragma unroll
+    for (int v = 0; v < VEC; ++v) {
+        sum[v] = 0.0f;
+        count[v] = 0;
+    }
+
+    int karea = params.kh * params.kw;
+    for (int ki = lane; ki < karea; ki += 32) {
+        int kh_idx = ki / params.kw;
+        int kw_idx = ki % params.kw;
+        int ih = kh_start + kh_idx * params.dh;
+        int iw = kw_start + kw_idx * params.dw;
+
+        bool in_input = (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W);
+        bool ih_in_pad = (ih >= -params.ph && ih < params.H + params.ph);
+        bool iw_in_pad = (iw >= -params.pw && iw < params.W + params.pw);
+
+        if (in_input) {
+            int64_t idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c_base;
+            const T* ptr = &input[idx];
+
+            if constexpr (std::is_same_v<T, float> && VEC == 4) {
+                float4 vec = *reinterpret_cast<const float4*>(ptr);
+                sum[0] += vec.x; sum[1] += vec.y; sum[2] += vec.z; sum[3] += vec.w;
+            } else if constexpr (std::is_same_v<T, half> && VEC == 2) {
+                half2 vec = *reinterpret_cast<const half2*>(ptr);
+                sum[0] += __low2float(vec);
+                sum[1] += __high2float(vec);
+            }
+            #pragma unroll
+            for (int v = 0; v < VEC; ++v) count[v]++;
+        } else if (params.count_include_pad && ih_in_pad && iw_in_pad) {
+            #pragma unroll
+            for (int v = 0; v < VEC; ++v) count[v]++;
+        }
+    }
+
+    // Warp-shuffle reduction per channel
+    #pragma unroll
+    for (int v = 0; v < VEC; ++v) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            sum[v] += __shfl_down_sync(0xffffffff, sum[v], offset);
+            count[v] += __shfl_down_sync(0xffffffff, count[v], offset);
+        }
+    }
+
+    if (lane == 0) {
+        int64_t oidx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c_base;
+        if constexpr (std::is_same_v<T, float> && VEC == 4) {
+            float4 out_vec;
+            #pragma unroll
+            for (int v = 0; v < VEC; ++v) {
+                float divisor = (params.divisor_override > 0) ? static_cast<float>(params.divisor_override) : static_cast<float>(count[v]);
+                out_vec.x = (v == 0) ? (divisor > 0.0f ? sum[v] / divisor : 0.0f) : out_vec.x;
+                out_vec.y = (v == 1) ? (divisor > 0.0f ? sum[v] / divisor : 0.0f) : out_vec.y;
+                out_vec.z = (v == 2) ? (divisor > 0.0f ? sum[v] / divisor : 0.0f) : out_vec.z;
+                out_vec.w = (v == 3) ? (divisor > 0.0f ? sum[v] / divisor : 0.0f) : out_vec.w;
+            }
+            *reinterpret_cast<float4*>(&output[oidx]) = out_vec;
+        } else if constexpr (std::is_same_v<T, half> && VEC == 2) {
+            float divisor0 = (params.divisor_override > 0) ? static_cast<float>(params.divisor_override) : static_cast<float>(count[0]);
+            float divisor1 = (params.divisor_override > 0) ? static_cast<float>(params.divisor_override) : static_cast<float>(count[1]);
+            float r0 = divisor0 > 0.0f ? sum[0] / divisor0 : 0.0f;
+            float r1 = divisor1 > 0.0f ? sum[1] / divisor1 : 0.0f;
+            half2 out_vec = __floats2half2_rn(r0, r1);
+            *reinterpret_cast<half2*>(&output[oidx]) = out_vec;
+        }
+    }
+}
+
+void avgpool_v13(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v13_f32", NVTX_COLOR_AVGPOOL);
+    if (params.C % 4 != 0) {
+        NVTX_RANGE_POP();
+        avgpool_v2(input, output, params, stream);
+        return;
+    }
+    const int total_ow = params.OH * params.OW;
+    const int C_vec = params.C / 4;
+    const int total_work = params.N * C_vec * total_ow;
+    const int threads = 256;
+    const int warps_per_block = 8;
+    const int blocks = (total_work + warps_per_block - 1) / warps_per_block;
+    avgpool_v13_kernel<float><<<blocks, threads, 0, stream>>>(input, output, params);
+    CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
+}
+
+void avgpool_v13(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v13_f16", NVTX_COLOR_AVGPOOL);
+    if (params.C % 2 != 0) {
+        NVTX_RANGE_POP();
+        avgpool_v2(input, output, params, stream);
+        return;
+    }
+    const int total_ow = params.OH * params.OW;
+    const int C_vec = params.C / 2;
+    const int total_work = params.N * C_vec * total_ow;
+    const int threads = 256;
+    const int warps_per_block = 8;
+    const int blocks = (total_work + warps_per_block - 1) / warps_per_block;
+    avgpool_v13_kernel<half><<<blocks, threads, 0, stream>>>(input, output, params);
+    CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
+}
+
+// ============================================================================
+// AvgPool2d v14: adaptive kernel dispatcher
+// Same decision tree as maxpool v14, tuned for avg pool characteristics.
+// ============================================================================
+
+void avgpool_v14(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v14_f32", NVTX_COLOR_AVGPOOL);
+
+    bool is_global = (params.kh >= params.H && params.kw >= params.W);
+    if (is_global) {
+        avgpool_v13(input, output, params, stream);
+        NVTX_RANGE_POP();
+        return;
+    }
+
+    int64_t total_output_elems = params.N * params.OH * params.OW * params.C;
+    if (total_output_elems < 65536) {
+        avgpool_v10(input, output, params, stream);
+        NVTX_RANGE_POP();
+        return;
+    }
+
+    if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3 && params.C >= 128) {
+        avgpool_v8(input, output, params, stream);
+        NVTX_RANGE_POP();
+        return;
+    }
+
+    avgpool_v2(input, output, params, stream);
+    NVTX_RANGE_POP();
+}
+
+void avgpool_v14(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v14_f16", NVTX_COLOR_AVGPOOL);
+
+    bool is_global = (params.kh >= params.H && params.kw >= params.W);
+    if (is_global) {
+        avgpool_v13(input, output, params, stream);
+        NVTX_RANGE_POP();
+        return;
+    }
+
+    int64_t total_output_elems = params.N * params.OH * params.OW * params.C;
+    if (total_output_elems < 65536) {
+        avgpool_v10(input, output, params, stream);
+        NVTX_RANGE_POP();
+        return;
+    }
+
+    if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3 && params.C >= 128) {
+        avgpool_v8(input, output, params, stream);
+        NVTX_RANGE_POP();
+        return;
+    }
+
+    avgpool_v2(input, output, params, stream);
+    NVTX_RANGE_POP();
+}

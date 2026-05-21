@@ -97,6 +97,10 @@ void maxpool_v10(const float* input, float* output, const PoolParams& params, cu
 void maxpool_v10(const half* input, half* output, const PoolParams& params, cudaStream_t stream);
 void maxpool_v11(const float* input, float* output, const PoolParams& params, cudaStream_t stream);
 void maxpool_v11(const half* input, half* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v12(const float* input, float* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v12(const half* input, half* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v13(const float* input, float* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v13(const half* input, half* output, const PoolParams& params, cudaStream_t stream);
 
 // AvgPool2d launchers (overloaded for float/half)
 void avgpool_v0(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream);
@@ -123,3 +127,13 @@ void avgpool_v10(const float* input, float* output, const AvgPoolParams& params,
 void avgpool_v10(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream);
 void avgpool_v11(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream);
 void avgpool_v11(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v12(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v12(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v13(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v13(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream);
+
+// v14: adaptive kernel dispatcher
+void maxpool_v14(const float* input, float* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v14(const half* input, half* output, const PoolParams& params, cudaStream_t stream);
+void avgpool_v14(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v14(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream);
