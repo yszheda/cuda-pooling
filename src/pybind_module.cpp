@@ -125,6 +125,15 @@ py::array_t<float> maxpool2d_f32(
         case 7:
             maxpool_v7(d_input, d_output, params, mapping, 0);
             break;
+        case 8:
+            maxpool_v8(d_input, d_output, params, 0);
+            break;
+        case 9:
+            maxpool_v9(d_input, d_output, params, 0);
+            break;
+        case 10:
+            maxpool_v10(d_input, d_output, params, 0);
+            break;
         default:
             CUDA_CHECK(cudaFree(d_input));
             CUDA_CHECK(cudaFree(d_output));
@@ -204,6 +213,15 @@ py::array maxpool2d_f16(
             break;
         case 7:
             maxpool_v7(d_input, d_output, params, mapping, 0);
+            break;
+        case 8:
+            maxpool_v8(d_input, d_output, params, 0);
+            break;
+        case 9:
+            maxpool_v9(d_input, d_output, params, 0);
+            break;
+        case 10:
+            maxpool_v10(d_input, d_output, params, 0);
             break;
         default:
             CUDA_CHECK(cudaFree(d_input));
@@ -307,6 +325,15 @@ py::array_t<float> avgpool2d_f32(
         case 7:
             avgpool_v7(d_input, d_output, params, mapping, 0);
             break;
+        case 8:
+            avgpool_v8(d_input, d_output, params, 0);
+            break;
+        case 9:
+            avgpool_v9(d_input, d_output, params, 0);
+            break;
+        case 10:
+            avgpool_v10(d_input, d_output, params, 0);
+            break;
         default:
             CUDA_CHECK(cudaFree(d_input));
             CUDA_CHECK(cudaFree(d_output));
@@ -389,6 +416,15 @@ py::array avgpool2d_f16(
         case 7:
             avgpool_v7(d_input, d_output, params, mapping, 0);
             break;
+        case 8:
+            avgpool_v8(d_input, d_output, params, 0);
+            break;
+        case 9:
+            avgpool_v9(d_input, d_output, params, 0);
+            break;
+        case 10:
+            avgpool_v10(d_input, d_output, params, 0);
+            break;
         default:
             CUDA_CHECK(cudaFree(d_input));
             CUDA_CHECK(cudaFree(d_output));
@@ -436,6 +472,9 @@ static float maxpool_launch_timed(
         case 5: maxpool_v5(d_input, d_output, params, stream); break;
         case 6: maxpool_v6(d_input, d_output, params, stream); break;
         case 7: maxpool_v7(d_input, d_output, params, mapping, stream); break;
+        case 8: maxpool_v8(d_input, d_output, params, stream); break;
+        case 9: maxpool_v9(d_input, d_output, params, stream); break;
+        case 10: maxpool_v10(d_input, d_output, params, stream); break;
         default:
             CUDA_CHECK(cudaEventDestroy(start));
             CUDA_CHECK(cudaEventDestroy(stop));
@@ -469,6 +508,9 @@ static float maxpool_launch_timed(
         case 5: maxpool_v5(d_input, d_output, params, stream); break;
         case 6: maxpool_v6(d_input, d_output, params, stream); break;
         case 7: maxpool_v7(d_input, d_output, params, mapping, stream); break;
+        case 8: maxpool_v8(d_input, d_output, params, stream); break;
+        case 9: maxpool_v9(d_input, d_output, params, stream); break;
+        case 10: maxpool_v10(d_input, d_output, params, stream); break;
         default:
             CUDA_CHECK(cudaEventDestroy(start));
             CUDA_CHECK(cudaEventDestroy(stop));
@@ -596,6 +638,9 @@ static float avgpool_launch_timed(
         case 5: avgpool_v5(d_input, d_output, params, stream); break;
         case 6: avgpool_v6(d_input, d_output, params, stream); break;
         case 7: avgpool_v7(d_input, d_output, params, mapping, stream); break;
+        case 8: avgpool_v8(d_input, d_output, params, stream); break;
+        case 9: avgpool_v9(d_input, d_output, params, stream); break;
+        case 10: avgpool_v10(d_input, d_output, params, stream); break;
         default:
             CUDA_CHECK(cudaEventDestroy(start));
             CUDA_CHECK(cudaEventDestroy(stop));
@@ -629,6 +674,9 @@ static float avgpool_launch_timed(
         case 5: avgpool_v5(d_input, d_output, params, stream); break;
         case 6: avgpool_v6(d_input, d_output, params, stream); break;
         case 7: avgpool_v7(d_input, d_output, params, mapping, stream); break;
+        case 8: avgpool_v8(d_input, d_output, params, stream); break;
+        case 9: avgpool_v9(d_input, d_output, params, stream); break;
+        case 10: avgpool_v10(d_input, d_output, params, stream); break;
         default:
             CUDA_CHECK(cudaEventDestroy(start));
             CUDA_CHECK(cudaEventDestroy(stop));

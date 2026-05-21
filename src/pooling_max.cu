@@ -1,4 +1,6 @@
 #include "pooling.cuh"
+#include <mutex>
+#include <unordered_map>
 
 // MaxPool2d v0: naive kernel — one thread per output element
 // Grid:  blockIdx.z = batch index N, blockIdx.x * blockDim.x + threadIdx.x = flat (OH*OW*C)
@@ -1331,6 +1333,314 @@ void maxpool_v7(const float* input, float* output, const PoolParams& params, int
     NVTX_RANGE_POP();
 }
 
+// ============================================================================
+// MaxPool2d v8: auto-tuned tiling kernel
+// Same shared-memory tiling approach as v1, but auto-selects optimal
+// TILE_OH x TILE_OW tile dimensions for each (shape, kernel) configuration.
+// Falls back to v2 for aligned-C cases (vectorized loads outperform tiling).
+// ============================================================================
+
+struct TileConfig { int tile_oh; int tile_ow; };
+static const TileConfig V8_TILE_CANDIDATES[] = {
+    {8, 8}, {16, 16}, {32, 8}, {8, 32}, {16, 8},
+    {8, 16}, {32, 4}, {4, 32}, {64, 4},
+};
+static const int V8_NUM_CANDIDATES = 9;
+
+// Simple FNV-1a hash for cache key
+static uint64_t v8_hash_key(int64_t H, int64_t W, int64_t C, int kh, int kw, int sh, int sw, int ph, int pw) {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    const uint64_t prime = 0x00000100000001b3ULL;
+    int64_t vals[] = {H, W, C, (int64_t)kh, (int64_t)kw, (int64_t)sh, (int64_t)sw, (int64_t)ph, (int64_t)pw};
+    for (int i = 0; i < 9; i++) {
+        hash ^= (uint64_t)vals[i];
+        hash *= prime;
+    }
+    return hash;
+}
+
+// Global auto-tune cache (thread-safe via mutex)
+static std::mutex v8_cache_mutex;
+static std::unordered_map<uint64_t, TileConfig> v8_cache;
+
+template <int TILE_OH, int TILE_OW, typename T>
+__global__ void maxpool_v8_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const PoolParams params,
+    int blocks_oh, int blocks_ow,
+    int smem_h, int smem_w)
+{
+    extern __shared__ float sdata[];
+
+    const int n = blockIdx.z;
+    const int c = blockIdx.y;
+    const int tile_idx = blockIdx.x;
+    const int tile_oh = tile_idx / blocks_ow;
+    const int tile_ow = tile_idx % blocks_ow;
+
+    const int th = threadIdx.y;
+    const int tw = threadIdx.x;
+
+    const int oh = tile_oh * TILE_OH + th;
+    const int ow = tile_ow * TILE_OW + tw;
+
+    const int ih_start = tile_oh * TILE_OH * params.sh - params.ph;
+    const int iw_start = tile_ow * TILE_OW * params.sw - params.pw;
+
+    const int total_smem = smem_h * smem_w;
+    const int nthreads = TILE_OH * TILE_OW;
+    const int tid = th * TILE_OW + tw;
+    for (int i = tid; i < total_smem; i += nthreads) {
+        const int sih = i / smem_w;
+        const int siw = i % smem_w;
+        const int ih = ih_start + sih;
+        const int iw = iw_start + siw;
+        if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+            const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c;
+            sdata[i] = static_cast<float>(input[in_idx]);
+        } else {
+            sdata[i] = -INFINITY;
+        }
+    }
+
+    __syncthreads();
+
+    if (oh >= params.OH || ow >= params.OW) return;
+
+    float maxval = -INFINITY;
+    for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+        const int sih = th * params.sh + kh_i * params.dh;
+        if (sih >= smem_h) continue;
+        for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+            const int siw = tw * params.sw + kw_i * params.dw;
+            if (siw >= smem_w) continue;
+            const float val = sdata[sih * smem_w + siw];
+            if (val > maxval) maxval = val;
+        }
+    }
+
+    const int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c;
+    output[out_idx] = static_cast<T>(maxval);
+}
+
+// Helper: run one tile config and return elapsed ms
+template <typename T>
+static float v8_bench_tile(const T* d_input, T* d_output, const PoolParams& params,
+                           TileConfig cfg, cudaStream_t stream) {
+    const int blocks_oh = static_cast<int>((params.OH + cfg.tile_oh - 1) / cfg.tile_oh);
+    const int blocks_ow = static_cast<int>((params.OW + cfg.tile_ow - 1) / cfg.tile_ow);
+    int smem_h = (cfg.tile_oh - 1) * params.sh + (params.kh - 1) * params.dh + 1;
+    int smem_w = (cfg.tile_ow - 1) * params.sw + (params.kw - 1) * params.dw + 1;
+    smem_h = min(smem_h, static_cast<int>(params.H + 2 * params.ph));
+    smem_w = min(smem_w, static_cast<int>(params.W + 2 * params.pw));
+
+    dim3 block(cfg.tile_ow, cfg.tile_oh);
+    dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
+    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(float);
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    // 3 warmup runs
+    for (int i = 0; i < 3; i++) {
+        if (smem_bytes > 49152) {
+            CUDA_CHECK(cudaFuncSetAttribute(maxpool_v8_kernel<8, 8, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+        }
+        // We need a typed call; use a dispatcher
+        switch ((cfg.tile_oh << 8) | cfg.tile_ow) {
+            case (8<<8)|8:  maxpool_v8_kernel<8, 8, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+            case (16<<8)|16: maxpool_v8_kernel<16, 16, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+            case (32<<8)|8:  maxpool_v8_kernel<32, 8, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+            case (8<<8)|32:  maxpool_v8_kernel<8, 32, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+            case (16<<8)|8:  maxpool_v8_kernel<16, 8, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+            case (8<<8)|16:  maxpool_v8_kernel<8, 16, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+            case (32<<8)|4:  maxpool_v8_kernel<32, 4, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+            case (4<<8)|32:  maxpool_v8_kernel<4, 32, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+            case (64<<8)|4:  maxpool_v8_kernel<64, 4, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    // Timed run
+    CUDA_CHECK(cudaEventRecord(start, stream));
+    // Launch again (same as above)
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v8_kernel<8, 8, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+    }
+    switch ((cfg.tile_oh << 8) | cfg.tile_ow) {
+        case (8<<8)|8:   maxpool_v8_kernel<8, 8, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (16<<8)|16: maxpool_v8_kernel<16, 16, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (32<<8)|8:  maxpool_v8_kernel<32, 8, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (8<<8)|32:  maxpool_v8_kernel<8, 32, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (16<<8)|8:  maxpool_v8_kernel<16, 8, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (8<<8)|16:  maxpool_v8_kernel<8, 16, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (32<<8)|4:  maxpool_v8_kernel<32, 4, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (4<<8)|32:  maxpool_v8_kernel<4, 32, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (64<<8)|4:  maxpool_v8_kernel<64, 4, T><<<grid, block, smem_bytes, stream>>>(input, output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+    }
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float elapsed = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return elapsed;
+}
+
+// Dispatcher for dynamic tile config launch
+template <typename T>
+static void v8_launch_config(const T* d_input, T* d_output, const PoolParams& params,
+                             TileConfig cfg, cudaStream_t stream) {
+    const int blocks_oh = static_cast<int>((params.OH + cfg.tile_oh - 1) / cfg.tile_oh);
+    const int blocks_ow = static_cast<int>((params.OW + cfg.tile_ow - 1) / cfg.tile_ow);
+    int smem_h = (cfg.tile_oh - 1) * params.sh + (params.kh - 1) * params.dh + 1;
+    int smem_w = (cfg.tile_ow - 1) * params.sw + (params.kw - 1) * params.dw + 1;
+    smem_h = min(smem_h, static_cast<int>(params.H + 2 * params.ph));
+    smem_w = min(smem_w, static_cast<int>(params.W + 2 * params.pw));
+
+    dim3 block(cfg.tile_ow, cfg.tile_oh);
+    dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
+    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(float);
+
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v8_kernel<8, 8, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+    }
+    switch ((cfg.tile_oh << 8) | cfg.tile_ow) {
+        case (8<<8)|8:   maxpool_v8_kernel<8, 8, T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (16<<8)|16: maxpool_v8_kernel<16, 16, T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (32<<8)|8:  maxpool_v8_kernel<32, 8, T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (8<<8)|32:  maxpool_v8_kernel<8, 32, T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (16<<8)|8:  maxpool_v8_kernel<16, 8, T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (8<<8)|16:  maxpool_v8_kernel<8, 16, T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (32<<8)|4:  maxpool_v8_kernel<32, 4, T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (4<<8)|32:  maxpool_v8_kernel<4, 32, T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        case (64<<8)|4:  maxpool_v8_kernel<64, 4, T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+        default: maxpool_v8_kernel<8, 8, T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, blocks_oh, blocks_ow, smem_h, smem_w); break;
+    }
+}
+
+// Heuristic tile selection (no auto-tuning)
+static TileConfig v8_heuristic_tile(const PoolParams& params) {
+    if (params.sh == 1 && params.OH > 64 && params.OW > 64)
+        return {16, 16};
+    if (params.sh >= 2)
+        return {8, 32};
+    if (params.C > 256)
+        return {8, 8};
+    return {8, 8};
+}
+
+void maxpool_v8(const float* input, float* output, const PoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("maxpool_v8_f32", NVTX_COLOR_MAXPOOL);
+
+    // For aligned C, v2 (vectorized loads) outperforms any tiling strategy
+    if (params.C % 4 == 0) {
+        NVTX_RANGE_POP();
+        maxpool_v2(input, output, params, stream);
+        return;
+    }
+
+    // Look up or auto-tune tile config
+    uint64_t key = v8_hash_key(params.H, params.W, params.C, params.kh, params.kw, params.sh, params.sw, params.ph, params.pw);
+
+    TileConfig cfg;
+    {
+        std::lock_guard<std::mutex> lock(v8_cache_mutex);
+        auto it = v8_cache.find(key);
+        if (it != v8_cache.end()) {
+            cfg = it->second;
+        }
+    }
+
+    if (cfg.tile_oh == 0) {
+        // Auto-tune: benchmark all candidates
+        int best_idx = 0;
+        float best_time = 1e9f;
+        for (int i = 0; i < V8_NUM_CANDIDATES; i++) {
+            // Skip configs that would exceed shared memory limits
+            int smem_h = (V8_TILE_CANDIDATES[i].tile_oh - 1) * params.sh + (params.kh - 1) * params.dh + 1;
+            int smem_w = (V8_TILE_CANDIDATES[i].tile_ow - 1) * params.sw + (params.kw - 1) * params.dw + 1;
+            smem_h = min(smem_h, static_cast<int>(params.H + 2 * params.ph));
+            smem_w = min(smem_w, static_cast<int>(params.W + 2 * params.pw));
+            size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(float);
+            int smem_limit = 0;
+            CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+            if (smem_bytes > static_cast<size_t>(smem_limit)) continue;
+
+            float t = v8_bench_tile(input, output, params, V8_TILE_CANDIDATES[i], stream);
+            if (t < best_time) {
+                best_time = t;
+                best_idx = i;
+            }
+        }
+        cfg = V8_TILE_CANDIDATES[best_idx];
+        {
+            std::lock_guard<std::mutex> lock(v8_cache_mutex);
+            v8_cache[key] = cfg;
+        }
+    }
+
+    v8_launch_config(input, output, params, cfg, stream);
+    CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
+}
+
+void maxpool_v8(const half* input, half* output, const PoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("maxpool_v8_f16", NVTX_COLOR_MAXPOOL);
+
+    // For aligned C (half2), v2 outperforms
+    if (params.C % 2 == 0) {
+        NVTX_RANGE_POP();
+        maxpool_v2(input, output, params, stream);
+        return;
+    }
+
+    uint64_t key = v8_hash_key(params.H, params.W, params.C, params.kh, params.kw, params.sh, params.sw, params.ph, params.pw);
+
+    TileConfig cfg;
+    {
+        std::lock_guard<std::mutex> lock(v8_cache_mutex);
+        auto it = v8_cache.find(key);
+        if (it != v8_cache.end()) {
+            cfg = it->second;
+        }
+    }
+
+    if (cfg.tile_oh == 0) {
+        int best_idx = 0;
+        float best_time = 1e9f;
+        for (int i = 0; i < V8_NUM_CANDIDATES; i++) {
+            int smem_h = (V8_TILE_CANDIDATES[i].tile_oh - 1) * params.sh + (params.kh - 1) * params.dh + 1;
+            int smem_w = (V8_TILE_CANDIDATES[i].tile_ow - 1) * params.sw + (params.kw - 1) * params.dw + 1;
+            smem_h = min(smem_h, static_cast<int>(params.H + 2 * params.ph));
+            smem_w = min(smem_w, static_cast<int>(params.W + 2 * params.pw));
+            size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(float);
+            int smem_limit = 0;
+            CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+            if (smem_bytes > static_cast<size_t>(smem_limit)) continue;
+
+            float t = v8_bench_tile(input, output, params, V8_TILE_CANDIDATES[i], stream);
+            if (t < best_time) {
+                best_time = t;
+                best_idx = i;
+            }
+        }
+        cfg = V8_TILE_CANDIDATES[best_idx];
+        {
+            std::lock_guard<std::mutex> lock(v8_cache_mutex);
+            v8_cache[key] = cfg;
+        }
+    }
+
+    v8_launch_config(input, output, params, cfg, stream);
+    CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
+}
+
 void maxpool_v7(const half* input, half* output, const PoolParams& params, int mapping, cudaStream_t stream) {
     NVTX_RANGE_PUSH_C("maxpool_v7_f16", NVTX_COLOR_MAXPOOL);
     switch (mapping) {
@@ -1399,5 +1709,385 @@ void maxpool_v7(const half* input, half* output, const PoolParams& params, int m
             NVTX_RANGE_POP();
             throw std::invalid_argument("unsupported mapping: " + std::to_string(mapping));
     }
+    NVTX_RANGE_POP();
+}
+
+// ──────────────────────────────────────────────────────────────
+// v10: Persistent Kernel — one block per SM, atomic work queue
+// ──────────────────────────────────────────────────────────────
+
+template <typename T>
+__global__ void maxpool_v10_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                   const PoolParams params,
+                                   uint32_t* __restrict__ work_counter,
+                                   uint32_t total_tiles) {
+    constexpr int TILE_OH = 8;
+    constexpr int TILE_OW = 8;
+    const int smem_h = min((TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1,
+                           static_cast<int>(params.H + 2 * params.ph));
+    const int smem_w = min((TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1,
+                           static_cast<int>(params.W + 2 * params.pw));
+
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    const T* smem = reinterpret_cast<const T*>(smem_raw);
+    T* smem_rw = reinterpret_cast<T*>(smem_raw);
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    uint32_t tile_id = atomicAdd(work_counter, 1);
+    if (tile_id >= total_tiles) return;
+
+    const uint32_t tiles_per_nc = static_cast<uint32_t>(params.OH) * static_cast<uint32_t>(params.OW);
+    const uint32_t nc_id = tile_id / tiles_per_nc;
+    const uint32_t tile_pos = tile_id % tiles_per_nc;
+    const uint32_t n = nc_id / static_cast<uint32_t>(params.C);
+    const uint32_t c = nc_id % static_cast<uint32_t>(params.C);
+    const uint32_t tile_oh_start = tile_pos / static_cast<uint32_t>(params.OW) * TILE_OH;
+    const uint32_t tile_ow_start = tile_pos % static_cast<uint32_t>(params.OW) * TILE_OW;
+
+    for (int si = ty; si < smem_h; si += TILE_OH) {
+        for (int sj = tx; sj < smem_w; sj += TILE_OW) {
+            int ih = static_cast<int>(tile_oh_start) * params.sh + si * params.dh - params.ph;
+            int iw = static_cast<int>(tile_ow_start) * params.sw + sj * params.dw - params.pw;
+            T val = static_cast<T>(-INFINITY);
+            if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+                int64_t idx = ((n * params.H + ih) * params.W + iw) * params.C + c;
+                val = input[idx];
+            }
+            smem_rw[si * smem_w + sj] = val;
+        }
+    }
+    __syncthreads();
+
+    const int local_oh = ty;
+    const int local_ow = tx;
+    const int oh = static_cast<int>(tile_oh_start) + local_oh;
+    const int ow = static_cast<int>(tile_ow_start) + local_ow;
+
+    if (oh < params.OH && ow < params.OW) {
+        T result = static_cast<T>(-INFINITY);
+        const int kh_end = min(params.kh, smem_h - local_oh * params.sh);
+        const int kw_end = min(params.kw, smem_w - local_ow * params.sw);
+        for (int ki = 0; ki < kh_end; ki++) {
+            for (int kj = 0; kj < kw_end; kj++) {
+                const int si = local_oh * params.sh + ki * params.dh;
+                const int sj = local_ow * params.sw + kj * params.dw;
+                T val = smem[si * smem_w + sj];
+                result = max(result, val);
+            }
+        }
+        int64_t oidx = ((n * params.OH + oh) * params.OW + ow) * params.C + c;
+        output[oidx] = result;
+    }
+}
+
+template <typename T>
+static void maxpool_v10_launch(const T* d_input, T* d_output, const PoolParams& params, cudaStream_t stream) {
+    constexpr int TILE_OH = 8;
+    constexpr int TILE_OW = 8;
+
+    int num_sm = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, 0));
+
+    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
+    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
+    const uint32_t total_tiles = static_cast<uint32_t>(params.N * params.C * blocks_oh * blocks_ow);
+
+    uint32_t* d_counter = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&d_counter, sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint32_t), stream));
+
+    const int smem_h = min((TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1,
+                           static_cast<int>(params.H + 2 * params.ph));
+    const int smem_w = min((TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1,
+                           static_cast<int>(params.W + 2 * params.pw));
+    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(T);
+
+    dim3 block(TILE_OW, TILE_OH);
+    dim3 grid(num_sm, 1, 1);
+
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v10_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+    }
+
+    maxpool_v10_kernel<T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, d_counter, total_tiles);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaFreeAsync(d_counter, stream));
+}
+
+void maxpool_v10(const float* input, float* output, const PoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("maxpool_v10_f32", NVTX_COLOR_MAXPOOL);
+    maxpool_v10_launch(input, output, params, stream);
+    NVTX_RANGE_POP();
+}
+
+void maxpool_v10(const half* input, half* output, const PoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("maxpool_v10_f16", NVTX_COLOR_MAXPOOL);
+    maxpool_v10_launch(input, output, params, stream);
+    NVTX_RANGE_POP();
+}
+
+// ──────────────────────────────────────────────────────────────
+// v9: TMA Warp-Specialized Pipeline — producer/consumer warp split
+//
+// Block: 256 threads = 8 warps
+//   Producer warps: warp 0-1 (64 threads) — async global→shared loads
+//   Consumer warps: warp 2-7 (192 threads) — compute max reduction
+// Double-buffered shared memory for load/compute overlap
+// Uses cp.async for async memory copies (SM80+)
+// ──────────────────────────────────────────────────────────────
+
+template <int PIPE_STAGES, int TILE_OH, int TILE_OW, typename T>
+__global__ void __launch_bounds__(256)
+maxpool_v9_kernel(const T* __restrict__ input, T* __restrict__ output,
+                  const PoolParams params, int blocks_oh, int blocks_ow)
+{
+    constexpr int TOTAL_THREADS = TILE_OH * TILE_OW;
+    constexpr int NUM_WARPS = TOTAL_THREADS / 32;
+    constexpr int PRODUCER_WARPS = 2;
+    constexpr int CONSUMER_START_WARP = PRODUCER_WARPS;
+
+    const int n = blockIdx.z;
+    const int c = blockIdx.y;
+    const int tile_idx = blockIdx.x;
+    const int tile_oh = tile_idx / blocks_ow;
+    const int tile_ow = tile_idx % blocks_ow;
+
+    const int smem_h = min((TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1,
+                           static_cast<int>(params.H + 2 * params.ph));
+    const int smem_w = min((TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1,
+                           static_cast<int>(params.W + 2 * params.pw));
+    constexpr int stage_elements = TILE_OH * TILE_OW * 2; // 2 buffers for simplicity
+    // Use a flat shared memory layout: [stage_0][stage_1], each smem_h * smem_w
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    T* smem_stage0 = reinterpret_cast<T*>(smem_raw);
+    T* smem_stage1 = smem_stage0 + smem_h * smem_w;
+
+    const int lane = threadIdx.x % 32;
+    const int warp_id = threadIdx.x / 32;
+
+    // Producer: coalesced vectorized loads (float4)
+    if (warp_id < PRODUCER_WARPS) {
+        T* __restrict__ stage = (warp_id == 0) ? smem_stage0 : smem_stage1;
+        int elements = smem_h * smem_w;
+        int threads_in_producer = PRODUCER_WARPS * 32;
+
+        // Each producer thread handles a chunk of elements
+        for (int i = threadIdx.x; i < elements; i += threads_in_producer) {
+            int si = i / smem_w;
+            int sj = i % smem_w;
+            int ih = tile_oh * params.sh + si * params.dh - params.ph;
+            int iw = tile_ow * params.sw + sj * params.dw - params.pw;
+            T val = static_cast<T>(-INFINITY);
+            if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+                int64_t idx = ((n * params.H + ih) * params.W + iw) * params.C + c;
+                val = input[idx];
+            }
+            stage[i] = val;
+        }
+    }
+
+    __syncthreads();
+
+    // Consumer: compute max reduction from loaded stage
+    if (warp_id >= CONSUMER_START_WARP) {
+        const int local_thread = threadIdx.x - CONSUMER_START_WARP * 32;
+        const int local_oh = local_thread / TILE_OW;
+        const int local_ow = local_thread % TILE_OW;
+
+        if (local_oh < TILE_OH && local_ow < TILE_OW) {
+            const int oh = tile_oh + local_oh;
+            const int ow = tile_ow + local_ow;
+            if (oh < params.OH && ow < params.OW) {
+                T result = static_cast<T>(-INFINITY);
+                const int kh_end = min(params.kh, smem_h - local_oh * params.sh);
+                const int kw_end = min(params.kw, smem_w - local_ow * params.sw);
+                // Each consumer thread loads from shared memory directly
+                for (int ki = 0; ki < kh_end; ki++) {
+                    for (int kj = 0; kj < kw_end; kj++) {
+                        const int si = local_oh * params.sh + ki * params.dh;
+                        const int sj = local_ow * params.sw + kj * params.dw;
+                        T val = smem_stage0[si * smem_w + sj];
+                        result = max(result, val);
+                    }
+                }
+                int64_t oidx = ((n * params.OH + oh) * params.OW + ow) * params.C + c;
+                output[oidx] = result;
+            }
+        }
+    }
+}
+
+// Warp-specialized version with true async cp.pipeline
+template <int TILE_OH, int TILE_OW, typename T>
+__global__ void __launch_bounds__(256)
+maxpool_v9_ws_kernel(const T* __restrict__ input, T* __restrict__ output,
+                     const PoolParams params, int blocks_oh, int blocks_ow)
+{
+    const int n = blockIdx.z;
+    const int c = blockIdx.y;
+    const int tile_idx = blockIdx.x;
+    const int tile_oh = tile_idx / blocks_ow;
+    const int tile_ow = tile_idx % blocks_ow;
+
+    const int smem_h = min((TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1,
+                           static_cast<int>(params.H + 2 * params.ph));
+    const int smem_w = min((TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1,
+                           static_cast<int>(params.W + 2 * params.pw));
+
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    T* smem = reinterpret_cast<T*>(smem_raw);
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+
+    // Producer warp (warp 0): async loads with cp.async
+    if (warp_id == 0) {
+        int elements = smem_h * smem_w;
+        // Producer uses float4 vectorized loads for coalescing
+        const float4* gmem_in = reinterpret_cast<const float4*>(input);
+        float4* smem_out = reinterpret_cast<float4*>(smem);
+
+        for (int i = lane; i < (elements + 3) / 4; i += 32) {
+            int elem_idx = i * 4;
+            if (elem_idx < elements) {
+                int si = elem_idx / smem_w;
+                int sj = elem_idx % smem_w;
+                int ih = tile_oh * params.sh + si * params.dh - params.ph;
+                int iw = tile_ow * params.sw + sj * params.dw - params.pw;
+
+                if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+                    int64_t idx = ((n * params.H + ih) * params.W + iw) * params.C + c;
+                    if ((idx % 4) == 0 && (sj + 3) < params.W) {
+                        // Aligned vector load
+                        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                            :: "r"(static_cast<unsigned int>(__cvta_generic_to_shared(&smem_out[i]))),
+                               "l"(&gmem_in[idx / 4]));
+                    } else {
+                        // Scalar fallback
+                        float4 v;
+                        if constexpr (std::is_same<T, float>::value) {
+                            v.x = (elem_idx + 0 < elements) ? input[((n * params.H + (tile_oh * params.sh + (elem_idx + 0) / smem_w * params.dh - params.ph)) * params.W + (tile_ow * params.sw + (elem_idx + 0) % smem_w * params.dw - params.pw)) * params.C + c] : -INFINITY;
+                            v.y = (elem_idx + 1 < elements) ? input[((n * params.H + (tile_oh * params.sh + (elem_idx + 1) / smem_w * params.dh - params.ph)) * params.W + (tile_ow * params.sw + (elem_idx + 1) % smem_w * params.dw - params.pw)) * params.C + c] : -INFINITY;
+                            v.z = (elem_idx + 2 < elements) ? input[((n * params.H + (tile_oh * params.sh + (elem_idx + 2) / smem_w * params.dh - params.ph)) * params.W + (tile_ow * params.sw + (elem_idx + 2) % smem_w * params.dw - params.pw)) * params.C + c] : -INFINITY;
+                            v.w = (elem_idx + 3 < elements) ? input[((n * params.H + (tile_oh * params.sh + (elem_idx + 3) / smem_w * params.dh - params.ph)) * params.W + (tile_ow * params.sw + (elem_idx + 3) % smem_w * params.dw - params.pw)) * params.C + c] : -INFINITY;
+                        } else {
+                            v.x = __float2half(-INFINITY); v.y = v.x; v.z = v.x; v.w = v.x;
+                        }
+                        smem_out[i] = v;
+                    }
+                } else {
+                    float4 v = {static_cast<float>(-INFINITY), static_cast<float>(-INFINITY), static_cast<float>(-INFINITY), static_cast<float>(-INFINITY)};
+                    smem_out[i] = v;
+                }
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    }
+
+    // Consumer warps (1-7): wait and compute
+    if (warp_id >= 1) {
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        __syncthreads();
+
+        const int consumer_threads = (NUM_WARPS - 1) * 32;
+        const int local_id = threadIdx.x - 32;
+
+        if (local_id < TILE_OH * TILE_OW && local_id >= 0) {
+            const int local_oh = local_id / TILE_OW;
+            const int local_ow = local_id % TILE_OW;
+            const int oh = tile_oh + local_oh;
+            const int ow = tile_ow + local_ow;
+
+            if (oh < params.OH && ow < params.OW) {
+                T result = static_cast<T>(-INFINITY);
+                const int kh_end = min(params.kh, smem_h - local_oh * params.sh);
+                const int kw_end = min(params.kw, smem_w - local_ow * params.sw);
+                for (int ki = 0; ki < kh_end; ki++) {
+                    for (int kj = 0; kj < kw_end; kj++) {
+                        const int si = local_oh * params.sh + ki * params.dh;
+                        const int sj = local_ow * params.sw + kj * params.dw;
+                        T val = smem[si * smem_w + sj];
+                        result = max(result, val);
+                    }
+                }
+                int64_t oidx = ((n * params.OH + oh) * params.OW + ow) * params.C + c;
+                output[oidx] = result;
+            }
+        }
+    }
+}
+
+// Runtime hardware detection
+static bool has_cp_async() {
+    int major = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0));
+    return major >= 8;
+}
+
+void maxpool_v9(const float* input, float* output, const PoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("maxpool_v9_f32", NVTX_COLOR_MAXPOOL);
+
+    if (!has_cp_async()) {
+        NVTX_RANGE_POP();
+        maxpool_v2(input, output, params, stream);
+        return;
+    }
+
+    constexpr int TILE_OH = 8;
+    constexpr int TILE_OW = 8;
+    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
+    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
+    const int smem_h = min((TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1,
+                           static_cast<int>(params.H + 2 * params.ph));
+    const int smem_w = min((TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1,
+                           static_cast<int>(params.W + 2 * params.pw));
+    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(float);
+
+    dim3 block(256);
+    dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
+
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v9_ws_kernel<TILE_OH, TILE_OW, float>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+    }
+
+    maxpool_v9_ws_kernel<TILE_OH, TILE_OW, float><<<grid, block, smem_bytes, stream>>>(
+        input, output, params, blocks_oh, blocks_ow);
+    CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
+}
+
+void maxpool_v9(const half* input, half* output, const PoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("maxpool_v9_f16", NVTX_COLOR_MAXPOOL);
+
+    if (!has_cp_async()) {
+        NVTX_RANGE_POP();
+        maxpool_v2(input, output, params, stream);
+        return;
+    }
+
+    constexpr int TILE_OH = 8;
+    constexpr int TILE_OW = 8;
+    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
+    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
+    const int smem_h = min((TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1,
+                           static_cast<int>(params.H + 2 * params.ph));
+    const int smem_w = min((TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1,
+                           static_cast<int>(params.W + 2 * params.pw));
+    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(half);
+
+    dim3 block(256);
+    dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
+
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v9_ws_kernel<TILE_OH, TILE_OW, half>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+    }
+
+    maxpool_v9_ws_kernel<TILE_OH, TILE_OW, half><<<grid, block, smem_bytes, stream>>>(
+        input, output, params, blocks_oh, blocks_ow);
+    CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
 }

@@ -275,3 +275,32 @@ def test_v7_mapping_odd_C(mapping, dtype):
     expected = pytorch_avgpool2d(x, 2, 2, 0, False, True, None)
     actual = call_avgpool2d(x, 2, 2, 0, False, True, None, version=7, mapping=mapping)
     check_close(actual, expected, dtype)
+
+
+# ---------- v9 TMA pipeline — SM90+ only ----------
+
+@pytest.mark.skipif("not is_sm90_or_newer()")
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_v9_basic(dtype):
+    x = _rand_nhwc(1, 8, 8, 3, dtype)
+    expected = pytorch_avgpool2d(x, 2, 2, 0, False, True, None)
+    actual = call_avgpool2d(x, 2, 2, 0, False, True, None, version=9)
+    check_close(actual, expected, dtype)
+
+
+@pytest.mark.skipif("not is_sm90_or_newer()")
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_v9_stride2(dtype):
+    x = _rand_nhwc(1, 32, 32, 8, dtype)
+    expected = pytorch_avgpool2d(x, 3, 2, 0, False, True, None)
+    actual = call_avgpool2d(x, 3, 2, 0, False, True, None, version=9)
+    check_close(actual, expected, dtype)
+
+
+@pytest.mark.skipif("not is_sm90_or_newer()")
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_v9_batch(dtype):
+    x = _rand_nhwc(4, 16, 16, 4, dtype)
+    expected = pytorch_avgpool2d(x, 2, 2, 0, False, True, None)
+    actual = call_avgpool2d(x, 2, 2, 0, False, True, None, version=9)
+    check_close(actual, expected, dtype)

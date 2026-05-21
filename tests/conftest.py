@@ -12,9 +12,18 @@ TOLERANCES = {
     np.float16: 1e-3,
 }
 
-MAXPOOL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 7]
-AVGPOOL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 7]
+MAXPOOL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10]
+AVGPOOL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10]
 MAPPING_VERSIONS = [0, 1, 2, 3]
+
+# v9 requires SM90+ for TMA/cp.async — test separately with skip
+def is_sm90_or_newer():
+    """Check if GPU is SM90+ (Hopper or newer)."""
+    try:
+        major = torch.cuda.get_device_capability()[0]
+        return major >= 9
+    except Exception:
+        return False
 
 
 def _is_valid_maxpool_padding(kernel_size, padding, dilation):
