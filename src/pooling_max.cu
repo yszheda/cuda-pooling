@@ -1803,13 +1803,112 @@ static void maxpool_v10_launch(const T* d_input, T* d_output, const PoolParams& 
 
 void maxpool_v10(const float* input, float* output, const PoolParams& params, cudaStream_t stream) {
     NVTX_RANGE_PUSH_C("maxpool_v10_f32", NVTX_COLOR_MAXPOOL);
+    // Persistent kernels help when launch overhead dominates:
+    // many small tiles with high N*C*OH*OW product
+    // For memory-bound pooling, v2's vectorized loads are faster
+    int64_t total_outputs = (int64_t)params.N * params.OH * params.OW * params.C;
+    if (total_outputs > 100000) {
+        NVTX_RANGE_POP();
+        maxpool_v2(input, output, params, stream);
+        return;
+    }
     maxpool_v10_launch(input, output, params, stream);
     NVTX_RANGE_POP();
 }
 
 void maxpool_v10(const half* input, half* output, const PoolParams& params, cudaStream_t stream) {
     NVTX_RANGE_PUSH_C("maxpool_v10_f16", NVTX_COLOR_MAXPOOL);
+    int64_t total_outputs = (int64_t)params.N * params.OH * params.OW * params.C;
+    if (total_outputs > 100000) {
+        NVTX_RANGE_POP();
+        maxpool_v2(input, output, params, stream);
+        return;
+    }
     maxpool_v10_launch(input, output, params, stream);
+    NVTX_RANGE_POP();
+}
+
+// ──────────────────────────────────────────────────────────────
+// v11: Warp-Shuffle Reduction — each warp processes one output
+// position using __shfl_down_sync for intra-warp max reduction.
+// Threads within a warp split the kernel window work.
+// ──────────────────────────────────────────────────────────────
+
+template <typename T>
+__global__ void maxpool_v11_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                   const PoolParams params, int blocks_oh, int blocks_ow)
+{
+    const int total_ow = params.OH * params.OW;
+    const int total_work = params.N * params.C * total_ow;
+    // One warp per output position
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+
+    if (warp_id >= total_work) return;
+
+    int tmp = warp_id;
+    const int ow = tmp % params.OW; tmp /= params.OW;
+    const int oh = tmp % params.OH; tmp /= params.OH;
+    const int c  = tmp % params.C;
+    const int n  = tmp / params.C;
+
+    const int lane = threadIdx.x % 32;
+    const int kh_start = oh * params.sh - params.ph;
+    const int kw_start = ow * params.sw - params.pw;
+
+    T result = static_cast<T>(-INFINITY);
+
+    for (int ki = lane; ki < params.kh; ki += 32) {
+        for (int kj = 0; kj < params.kw; kj++) {
+            int ih = kh_start + ki * params.dh;
+            int iw = kw_start + kj * params.dw;
+            if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
+                int64_t iidx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c;
+                T val = input[iidx];
+                if constexpr (std::is_same<T, half>::value) {
+                    result = __hmax(result, val);
+                } else {
+                    result = max(result, val);
+                }
+            }
+        }
+    }
+
+    // Warp-level max reduction using shuffle
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        if constexpr (std::is_same<T, half>::value) {
+            result = __hmax(result, __shfl_down_sync(0xffffffff, result, offset));
+        } else {
+            result = max(result, __shfl_down_sync(0xffffffff, result, offset));
+        }
+    }
+
+    // Lane 0 writes result
+    if (lane == 0) {
+        int64_t oidx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c;
+        output[oidx] = result;
+    }
+}
+
+void maxpool_v11(const float* input, float* output, const PoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("maxpool_v11_f32", NVTX_COLOR_MAXPOOL);
+    const int total_ow = params.OH * params.OW;
+    const int total_work = params.N * params.C * total_ow;
+    const int threads = 256;  // 8 warps
+    const int blocks = (total_work + 7) / 8;  // 8 warps per block
+    maxpool_v11_kernel<float><<<blocks, threads, 0, stream>>>(input, output, params, 0, 0);
+    CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
+}
+
+void maxpool_v11(const half* input, half* output, const PoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("maxpool_v11_f16", NVTX_COLOR_MAXPOOL);
+    const int total_ow = params.OH * params.OW;
+    const int total_work = params.N * params.C * total_ow;
+    const int threads = 256;
+    const int blocks = (total_work + 7) / 8;
+    maxpool_v11_kernel<half><<<blocks, threads, 0, stream>>>(input, output, params, 0, 0);
+    CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
 }
 

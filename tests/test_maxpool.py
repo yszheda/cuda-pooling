@@ -3,6 +3,7 @@ import pytest
 from conftest import (
     pytorch_maxpool2d, call_maxpool2d, check_close,
     MAXPOOL_VERSIONS, TOLERANCES, MAPPING_VERSIONS,
+    is_sm90_or_newer,
 )
 
 

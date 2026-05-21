@@ -3,6 +3,7 @@ import pytest
 from conftest import (
     pytorch_avgpool2d, call_avgpool2d, check_close,
     AVGPOOL_VERSIONS, TOLERANCES, MAPPING_VERSIONS,
+    is_sm90_or_newer,
 )
 
 

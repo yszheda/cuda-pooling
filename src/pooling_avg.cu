@@ -2100,11 +2100,9 @@ __global__ void avgpool_v10_kernel(const T* __restrict__ input, T* __restrict__ 
                     int src_ih = ih_base + si;
                     int src_iw = iw_base + sj;
                     bool in_input = (src_ih >= 0 && src_ih < params.H && src_iw >= 0 && src_iw < params.W);
-                    bool in_explicit_pad = !in_input && (
-                        (src_ih >= -params.ph && src_ih < 0) || (src_ih >= params.H && src_ih < params.H + params.ph) ||
-                        (src_iw >= -params.pw && src_iw < 0) || (src_iw >= params.W && src_iw < params.W + params.pw)
-                    );
-                    bool valid = in_input || (params.count_include_pad && in_explicit_pad);
+                    bool ih_in_pad = (src_ih >= -params.ph && src_ih < params.H + params.ph);
+                    bool iw_in_pad = (src_iw >= -params.pw && src_iw < params.W + params.pw);
+                    bool valid = in_input || (params.count_include_pad && ih_in_pad && iw_in_pad);
                     if (valid) {
                         sum += static_cast<float>(smem[si * smem_w + sj]);
                         count++;
@@ -2155,13 +2153,117 @@ static void avgpool_v10_launch(const T* d_input, T* d_output, const AvgPoolParam
 
 void avgpool_v10(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
     NVTX_RANGE_PUSH_C("avgpool_v10_f32", NVTX_COLOR_AVGPOOL);
+    int64_t total_outputs = (int64_t)params.N * params.OH * params.OW * params.C;
+    if (total_outputs > 100000) {
+        NVTX_RANGE_POP();
+        avgpool_v2(input, output, params, stream);
+        return;
+    }
     avgpool_v10_launch(input, output, params, stream);
     NVTX_RANGE_POP();
 }
 
 void avgpool_v10(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
     NVTX_RANGE_PUSH_C("avgpool_v10_f16", NVTX_COLOR_AVGPOOL);
+    int64_t total_outputs = (int64_t)params.N * params.OH * params.OW * params.C;
+    if (total_outputs > 100000) {
+        NVTX_RANGE_POP();
+        avgpool_v2(input, output, params, stream);
+        return;
+    }
     avgpool_v10_launch(input, output, params, stream);
+    NVTX_RANGE_POP();
+}
+
+// ──────────────────────────────────────────────────────────────
+// v11: Warp-Shuffle Reduction — use __shfl_down_sync for intra-warp
+// sum/count reduction instead of shared memory. Each warp processes
+// one output position, threads reduce the kernel window.
+// ──────────────────────────────────────────────────────────────
+
+template <typename T>
+__global__ void avgpool_v11_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                   const AvgPoolParams params, int blocks_oh, int blocks_ow)
+{
+    const int total_ow = params.OH * params.OW;
+    const int total_work = params.N * params.C * total_ow;
+    // One warp per output position
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+
+    if (warp_id >= total_work) return;
+
+    int tmp = warp_id;
+    const int ow = tmp % params.OW; tmp /= params.OW;
+    const int oh = tmp % params.OH; tmp /= params.OH;
+    const int c  = tmp % params.C;
+    const int n  = tmp / params.C;
+
+    const int lane = threadIdx.x % 32;
+    const int kh_start = oh * params.sh - params.ph;
+    const int kw_start = ow * params.sw - params.pw;
+
+    float sum = 0.0f;
+    int count = 0;
+
+    for (int ki = lane; ki < params.kh; ki += 32) {
+        for (int kj = 0; kj < params.kw; kj++) {
+            int ih = kh_start + ki * params.dh;
+            int iw = kw_start + kj * params.dw;
+            bool in_input = (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W);
+            bool ih_in_pad = (ih >= -params.ph && ih < params.H + params.ph);
+            bool iw_in_pad = (iw >= -params.pw && iw < params.W + params.pw);
+            bool valid = in_input || (params.count_include_pad && ih_in_pad && iw_in_pad);
+            if (valid) {
+                T val = T(0);
+                if (in_input) {
+                    int64_t iidx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c;
+                    val = input[iidx];
+                }
+                sum += static_cast<float>(val);
+                count++;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        count += __shfl_down_sync(0xffffffff, count, offset);
+    }
+
+    if (lane == 0) {
+        int64_t divisor = count;
+        if (params.divisor_override > 0) divisor = static_cast<int64_t>(params.divisor_override);
+        else if (count == 0) divisor = 1;
+        int64_t oidx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c;
+        output[oidx] = static_cast<T>(sum / static_cast<float>(divisor));
+    }
+}
+
+void avgpool_v11(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v11_f32", NVTX_COLOR_AVGPOOL);
+    const int total_ow = params.OH * params.OW;
+    const int total_work = params.N * params.C * total_ow;
+    const int threads = 256;
+    const int warps_per_block = 8;
+    const int blocks = (total_work + warps_per_block - 1) / warps_per_block;
+    avgpool_v11_kernel<float><<<blocks, threads, 0, stream>>>(input, output, params, 0, 0);
+    CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
+}
+
+void avgpool_v11(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v11_f16", NVTX_COLOR_AVGPOOL);
+    const int total_ow = params.OH * params.OW;
+    const int total_work = params.N * params.C * total_ow;
+    const int threads = 256;
+    const int warps_per_block = 8;
+    const int blocks = (total_work + warps_per_block - 1) / warps_per_block;
+    avgpool_v11_kernel<half><<<blocks, threads, 0, stream>>>(input, output, params, 0, 0);
+    CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
 }
 
