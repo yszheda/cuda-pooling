@@ -2135,8 +2135,11 @@ static void avgpool_v10_launch(const T* d_input, T* d_output, const AvgPoolParam
     const int smem_w = TILE_OW * params.sw + (params.kw - 1) * params.dw + 1;
     size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(T) + sizeof(uint32_t);
 
-    uint32_t* d_counter = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&d_counter, sizeof(uint32_t), stream));
+    // Use static device memory for counter to avoid cudaMallocAsync pollution
+    static uint32_t* d_counter = nullptr;
+    if (d_counter == nullptr) {
+        CUDA_CHECK(cudaMalloc(&d_counter, sizeof(uint32_t)));
+    }
     CUDA_CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint32_t), stream));
 
     dim3 block(TILE_OW, TILE_OH);
@@ -2148,7 +2151,6 @@ static void avgpool_v10_launch(const T* d_input, T* d_output, const AvgPoolParam
 
     avgpool_v10_kernel<T><<<grid, block, smem_bytes, stream>>>(d_input, d_output, params, d_counter, total_tiles, blocks_oh, blocks_ow, smem_h, smem_w);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaFreeAsync(d_counter, stream));
 }
 
 void avgpool_v10(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {

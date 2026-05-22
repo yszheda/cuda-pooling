@@ -5,9 +5,43 @@
 #include <vector>
 #include <stdexcept>
 #include <string>
+#include <mutex>
 #include "pooling.cuh"
 
 namespace py = pybind11;
+
+// Pre-allocated device memory arena to avoid cudaMalloc/cudaFree during runtime.
+// Sequential malloc/free across different kernel types caused "misaligned address"
+// errors in batch tests. We reserve large buffers once and reuse them.
+struct DeviceArena {
+    void* ptr = nullptr;
+    size_t capacity = 0;
+
+    ~DeviceArena() { if (ptr) cudaFree(ptr); }
+
+    void ensure(size_t bytes) {
+        if (bytes <= capacity) return;
+        if (ptr) cudaFree(ptr);
+        CUDA_CHECK(cudaMalloc(&ptr, bytes));
+        capacity = bytes;
+    }
+};
+
+static std::mutex arena_mutex;
+static DeviceArena arena_f32_in;   // max 256 MB for f32 input
+static DeviceArena arena_f32_out;  // max 256 MB for f32 output
+static DeviceArena arena_f16_in;   // max 128 MB for f16 input
+static DeviceArena arena_f16_out;  // max 128 MB for f16 output
+
+static constexpr size_t MAX_F32_BYTES = 256ULL * 1024 * 1024;
+static constexpr size_t MAX_F16_BYTES = 128ULL * 1024 * 1024;
+
+static void init_arenas() {
+    arena_f32_in.ensure(MAX_F32_BYTES);
+    arena_f32_out.ensure(MAX_F32_BYTES);
+    arena_f16_in.ensure(MAX_F16_BYTES);
+    arena_f16_out.ensure(MAX_F16_BYTES);
+}
 
 // Parse a parameter that can be int or tuple(int, int) into (h, w)
 static std::pair<int, int> parse_pair(const py::object& obj) {
@@ -92,11 +126,14 @@ py::array_t<float> maxpool2d_f32(
     size_t in_nelms = buf.size;
     size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
 
-    // Allocate device buffers and copy input H2D
-    float* d_input = nullptr;
-    float* d_output = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_input, in_nelms * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_output, out_nelms * sizeof(float)));
+    // Allocate device buffers from arena and copy input H2D
+    {
+        std::lock_guard<std::mutex> lock(arena_mutex);
+        arena_f32_in.ensure(in_nelms * sizeof(float));
+        arena_f32_out.ensure(out_nelms * sizeof(float));
+    }
+    float* d_input = static_cast<float*>(arena_f32_in.ptr);
+    float* d_output = static_cast<float*>(arena_f32_out.ptr);
     CUDA_CHECK(cudaMemcpy(d_input, buf.ptr, in_nelms * sizeof(float), cudaMemcpyHostToDevice));
 
     // Launch kernel
@@ -147,18 +184,15 @@ py::array_t<float> maxpool2d_f32(
             maxpool_v14(d_input, d_output, params, 0);
             break;
         default:
-            CUDA_CHECK(cudaFree(d_input));
-            CUDA_CHECK(cudaFree(d_output));
             throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
     }
 
-    // Copy output D2H and free device memory
+    // Copy output D2H
     std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
     auto output = py::array_t<float>(out_shape);
     auto out_buf = output.request();
+    CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(out_buf.ptr, d_output, out_nelms * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_input));
-    CUDA_CHECK(cudaFree(d_output));
 
     return output;
 }
@@ -194,10 +228,13 @@ py::array maxpool2d_f16(
     size_t out_nbytes = out_nelms * sizeof(half);
 
     // Allocate device buffers and copy input H2D
-    half* d_input = nullptr;
-    half* d_output = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_input, in_nbytes));
-    CUDA_CHECK(cudaMalloc(&d_output, out_nbytes));
+    {
+        std::lock_guard<std::mutex> lock(arena_mutex);
+        arena_f16_in.ensure(in_nbytes);
+        arena_f16_out.ensure(out_nbytes);
+    }
+    half* d_input = static_cast<half*>(arena_f16_in.ptr);
+    half* d_output = static_cast<half*>(arena_f16_out.ptr);
     CUDA_CHECK(cudaMemcpy(d_input, input.data(), in_nbytes, cudaMemcpyHostToDevice));
 
     // Launch kernel
@@ -248,10 +285,11 @@ py::array maxpool2d_f16(
             maxpool_v14(d_input, d_output, params, 0);
             break;
         default:
-            CUDA_CHECK(cudaFree(d_input));
-            CUDA_CHECK(cudaFree(d_output));
             throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
     }
+
+    // Copy result back before allowing next call to reuse arena
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // Allocate output numpy array with float16 dtype
     std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
@@ -260,8 +298,6 @@ py::array maxpool2d_f16(
 
     // Copy output D2H and free device memory
     CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nbytes, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_input));
-    CUDA_CHECK(cudaFree(d_output));
 
     return output;
 }
@@ -316,11 +352,14 @@ py::array_t<float> avgpool2d_f32(
     size_t in_nelms = buf.size;
     size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
 
-    // Allocate device buffers and copy input H2D
-    float* d_input = nullptr;
-    float* d_output = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_input, in_nelms * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_output, out_nelms * sizeof(float)));
+    // Allocate device buffers from arena and copy input H2D
+    {
+        std::lock_guard<std::mutex> lock(arena_mutex);
+        arena_f32_in.ensure(in_nelms * sizeof(float));
+        arena_f32_out.ensure(out_nelms * sizeof(float));
+    }
+    float* d_input = static_cast<float*>(arena_f32_in.ptr);
+    float* d_output = static_cast<float*>(arena_f32_out.ptr);
     CUDA_CHECK(cudaMemcpy(d_input, buf.ptr, in_nelms * sizeof(float), cudaMemcpyHostToDevice));
 
     // Launch kernel
@@ -371,18 +410,15 @@ py::array_t<float> avgpool2d_f32(
             avgpool_v14(d_input, d_output, params, 0);
             break;
         default:
-            CUDA_CHECK(cudaFree(d_input));
-            CUDA_CHECK(cudaFree(d_output));
             throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
     }
 
-    // Copy output D2H and free device memory
+    // Copy output D2H
     std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
     auto output = py::array_t<float>(out_shape);
     auto out_buf = output.request();
+    CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(out_buf.ptr, d_output, out_nelms * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_input));
-    CUDA_CHECK(cudaFree(d_output));
 
     return output;
 }
@@ -419,11 +455,14 @@ py::array avgpool2d_f16(
     size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
     size_t out_nbytes = out_nelms * sizeof(half);
 
-    // Allocate device buffers and copy input H2D
-    half* d_input = nullptr;
-    half* d_output = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_input, in_nbytes));
-    CUDA_CHECK(cudaMalloc(&d_output, out_nbytes));
+    // Allocate device buffers from arena and copy input H2D
+    {
+        std::lock_guard<std::mutex> lock(arena_mutex);
+        arena_f16_in.ensure(in_nbytes);
+        arena_f16_out.ensure(out_nbytes);
+    }
+    half* d_input = static_cast<half*>(arena_f16_in.ptr);
+    half* d_output = static_cast<half*>(arena_f16_out.ptr);
     CUDA_CHECK(cudaMemcpy(d_input, input.data(), in_nbytes, cudaMemcpyHostToDevice));
 
     // Launch kernel
@@ -474,20 +513,18 @@ py::array avgpool2d_f16(
             avgpool_v14(d_input, d_output, params, 0);
             break;
         default:
-            CUDA_CHECK(cudaFree(d_input));
-            CUDA_CHECK(cudaFree(d_output));
             throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
     }
+
+    // Wait for kernel to finish before allowing next call to reuse arena
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // Allocate output numpy array with float16 dtype
     std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
     py::module_ np = py::module_::import("numpy");
     auto output = np.attr("empty")(out_shape, np.attr("float16")).cast<py::array>();
 
-    // Copy output D2H and free device memory
     CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nbytes, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_input));
-    CUDA_CHECK(cudaFree(d_output));
 
     return output;
 }
@@ -606,10 +643,14 @@ py::tuple maxpool2d_timed_f32(
     size_t in_nelms = buf.size;
     size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
 
-    float* d_input = nullptr;
-    float* d_output = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_input, in_nelms * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_output, out_nelms * sizeof(float)));
+    // Allocate device buffers from arena
+    {
+        std::lock_guard<std::mutex> lock(arena_mutex);
+        arena_f32_in.ensure(in_nelms * sizeof(float));
+        arena_f32_out.ensure(out_nelms * sizeof(float));
+    }
+    float* d_input = static_cast<float*>(arena_f32_in.ptr);
+    float* d_output = static_cast<float*>(arena_f32_out.ptr);
     CUDA_CHECK(cudaMemcpy(d_input, buf.ptr, in_nelms * sizeof(float), cudaMemcpyHostToDevice));
 
     float elapsed_ms = maxpool_launch_timed(d_input, d_output, params, version, mapping, 0);
@@ -617,9 +658,8 @@ py::tuple maxpool2d_timed_f32(
     std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
     auto output = py::array_t<float>(out_shape);
     auto out_buf = output.request();
+    CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(out_buf.ptr, d_output, out_nelms * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_input));
-    CUDA_CHECK(cudaFree(d_output));
 
     NVTX_RANGE_POP();
     return py::make_tuple(output, elapsed_ms);
@@ -654,10 +694,14 @@ py::tuple maxpool2d_timed_f16(
     size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
     size_t out_nbytes = out_nelms * sizeof(half);
 
-    half* d_input = nullptr;
-    half* d_output = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_input, in_nbytes));
-    CUDA_CHECK(cudaMalloc(&d_output, out_nbytes));
+    // Allocate device buffers from arena
+    {
+        std::lock_guard<std::mutex> lock(arena_mutex);
+        arena_f16_in.ensure(in_nbytes);
+        arena_f16_out.ensure(out_nbytes);
+    }
+    half* d_input = static_cast<half*>(arena_f16_in.ptr);
+    half* d_output = static_cast<half*>(arena_f16_out.ptr);
     CUDA_CHECK(cudaMemcpy(d_input, input.data(), in_nbytes, cudaMemcpyHostToDevice));
 
     float elapsed_ms = maxpool_launch_timed(d_input, d_output, params, version, mapping, 0);
@@ -666,9 +710,8 @@ py::tuple maxpool2d_timed_f16(
     py::module_ np = py::module_::import("numpy");
     auto output = np.attr("empty")(out_shape, np.attr("float16")).cast<py::array>();
 
+    CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nbytes, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_input));
-    CUDA_CHECK(cudaFree(d_output));
 
     NVTX_RANGE_POP();
     return py::make_tuple(output, elapsed_ms);
@@ -784,10 +827,14 @@ py::tuple avgpool2d_timed_f32(
     size_t in_nelms = buf.size;
     size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
 
-    float* d_input = nullptr;
-    float* d_output = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_input, in_nelms * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_output, out_nelms * sizeof(float)));
+    // Allocate device buffers from arena
+    {
+        std::lock_guard<std::mutex> lock(arena_mutex);
+        arena_f32_in.ensure(in_nelms * sizeof(float));
+        arena_f32_out.ensure(out_nelms * sizeof(float));
+    }
+    float* d_input = static_cast<float*>(arena_f32_in.ptr);
+    float* d_output = static_cast<float*>(arena_f32_out.ptr);
     CUDA_CHECK(cudaMemcpy(d_input, buf.ptr, in_nelms * sizeof(float), cudaMemcpyHostToDevice));
 
     float elapsed_ms = avgpool_launch_timed(d_input, d_output, params, version, mapping, 0);
@@ -795,9 +842,8 @@ py::tuple avgpool2d_timed_f32(
     std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
     auto output = py::array_t<float>(out_shape);
     auto out_buf = output.request();
+    CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(out_buf.ptr, d_output, out_nelms * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_input));
-    CUDA_CHECK(cudaFree(d_output));
 
     NVTX_RANGE_POP();
     return py::make_tuple(output, elapsed_ms);
@@ -836,10 +882,14 @@ py::tuple avgpool2d_timed_f16(
     size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
     size_t out_nbytes = out_nelms * sizeof(half);
 
-    half* d_input = nullptr;
-    half* d_output = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_input, in_nbytes));
-    CUDA_CHECK(cudaMalloc(&d_output, out_nbytes));
+    // Allocate device buffers from arena
+    {
+        std::lock_guard<std::mutex> lock(arena_mutex);
+        arena_f16_in.ensure(in_nbytes);
+        arena_f16_out.ensure(out_nbytes);
+    }
+    half* d_input = static_cast<half*>(arena_f16_in.ptr);
+    half* d_output = static_cast<half*>(arena_f16_out.ptr);
     CUDA_CHECK(cudaMemcpy(d_input, input.data(), in_nbytes, cudaMemcpyHostToDevice));
 
     float elapsed_ms = avgpool_launch_timed(d_input, d_output, params, version, mapping, 0);
@@ -848,9 +898,8 @@ py::tuple avgpool2d_timed_f16(
     py::module_ np = py::module_::import("numpy");
     auto output = np.attr("empty")(out_shape, np.attr("float16")).cast<py::array>();
 
+    CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nbytes, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_input));
-    CUDA_CHECK(cudaFree(d_output));
 
     NVTX_RANGE_POP();
     return py::make_tuple(output, elapsed_ms);

@@ -21,6 +21,7 @@ add_library(pooling_kernels STATIC
     src/pooling_max.cu
     src/pooling_avg.cu
 )
+set_target_properties(pooling_kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(pooling_kernels PUBLIC include)
 target_compile_options(pooling_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 
