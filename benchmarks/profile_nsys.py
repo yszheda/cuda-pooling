@@ -27,7 +27,7 @@ PROFILING_CASES = [
     ("yolo_sppf", "max", 5, 1, 2, 1, False, None, None, (1, 20, 20, 512)),
 ]
 
-ALL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10]
+ALL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15]
 V7_MAPPINGS = [0, 1, 2, 3]
 
 

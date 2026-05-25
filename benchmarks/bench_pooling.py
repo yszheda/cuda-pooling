@@ -91,7 +91,7 @@ MODEL_CASES = [
     ("swin_global", "avg", None, 1, 0, 1, False, True, None, (1, 7, 7, 768)),
 ]
 
-ALL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10]
+ALL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15]
 V7_MAPPINGS = [0, 1, 2, 3]
 
 
