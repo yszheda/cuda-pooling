@@ -2476,10 +2476,10 @@ void maxpool_v14(const float* input, float* output, const PoolParams& params, cu
         return;
     }
 
-    // Stride-1 3x3 with high channel count: v8 auto-tuned tiling exploits
-    // shared memory staging for the high data reuse pattern
-    if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3 && params.C >= 128) {
-        maxpool_v8(input, output, params, stream);
+    // Stride-1 3x3: v15 swizzled shared memory eliminates bank conflicts
+    // for adjacent-thread overlapping window access
+    if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3) {
+        maxpool_v15(input, output, params, stream);
         NVTX_RANGE_POP();
         return;
     }
@@ -2506,8 +2506,9 @@ void maxpool_v14(const half* input, half* output, const PoolParams& params, cuda
         return;
     }
 
-    if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3 && params.C >= 128) {
-        maxpool_v8(input, output, params, stream);
+    // Stride-1 3x3: v15 swizzled shared memory eliminates bank conflicts
+    if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3) {
+        maxpool_v15(input, output, params, stream);
         NVTX_RANGE_POP();
         return;
     }

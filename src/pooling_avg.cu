@@ -2725,8 +2725,8 @@ void avgpool_v14(const float* input, float* output, const AvgPoolParams& params,
         return;
     }
 
-    if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3 && params.C >= 128) {
-        avgpool_v8(input, output, params, stream);
+    if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3) {
+        avgpool_v15(input, output, params, stream);
         NVTX_RANGE_POP();
         return;
     }
@@ -2752,8 +2752,8 @@ void avgpool_v14(const half* input, half* output, const AvgPoolParams& params, c
         return;
     }
 
-    if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3 && params.C >= 128) {
-        avgpool_v8(input, output, params, stream);
+    if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3) {
+        avgpool_v15(input, output, params, stream);
         NVTX_RANGE_POP();
         return;
     }
