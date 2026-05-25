@@ -1699,8 +1699,12 @@ __global__ void maxpool_v10_kernel(const T* __restrict__ input, T* __restrict__ 
     constexpr int TILE_OW = 8;
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
+    // Round up T array size to 4 bytes to ensure s_tile (uint32_t*) is 4-byte aligned
+    // for atomicAdd. This matters when T=half (sizeof=2) and smem_h*smem_w is odd.
+    static_assert(alignof(uint32_t) == 4, "uint32_t must be 4-byte aligned");
+    size_t smem_offset = ((static_cast<size_t>(smem_h) * smem_w * sizeof(T) + 3) / 4) * 4;
     T* smem = reinterpret_cast<T*>(smem_raw);
-    uint32_t* s_tile = reinterpret_cast<uint32_t*>(smem + smem_h * smem_w);
+    uint32_t* s_tile = reinterpret_cast<uint32_t*>(smem_raw + smem_offset);
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
