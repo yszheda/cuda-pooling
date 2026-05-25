@@ -6,6 +6,8 @@
 #include <type_traits>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 #define CUDA_CHECK(call) \
     do { cudaError_t err = call; if (err != cudaSuccess) \
@@ -143,3 +145,60 @@ void maxpool_v15(const float* input, float* output, const PoolParams& params, cu
 void maxpool_v15(const half* input, half* output, const PoolParams& params, cudaStream_t stream);
 void avgpool_v15(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream);
 void avgpool_v15(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// dtype traits for pybind template instantiation
+// ---------------------------------------------------------------------------
+enum class PoolDType { F32, F16, BF16, FP8_E4M3, FP8_E5M2, I8, I16 };
+
+template <PoolDType D> struct dtype_traits;
+
+template <> struct dtype_traits<PoolDType::F32> {
+    using ctype = float;
+    static constexpr const char* name = "f32";
+    static constexpr size_t itemsize = 4;
+    static constexpr char np_kind = 'f';
+    static bool validate_np_kind(char k) { return k == 'f'; }
+};
+template <> struct dtype_traits<PoolDType::F16> {
+    using ctype = half;
+    static constexpr const char* name = "f16";
+    static constexpr size_t itemsize = 2;
+    static constexpr char np_kind = 'f';
+    static bool validate_np_kind(char k) { return k == 'f'; }
+};
+template <> struct dtype_traits<PoolDType::BF16> {
+    using ctype = nv_bfloat16;
+    static constexpr const char* name = "bf16";
+    static constexpr size_t itemsize = 2;
+    static constexpr char np_kind = 'u';  // numpy uint16 view
+    static bool validate_np_kind(char k) { return k == 'u'; }
+};
+template <> struct dtype_traits<PoolDType::FP8_E4M3> {
+    using ctype = __nv_fp8_e4m3;
+    static constexpr const char* name = "fp8_e4m3";
+    static constexpr size_t itemsize = 1;
+    static constexpr char np_kind = 'u';  // numpy uint8 view
+    static bool validate_np_kind(char k) { return k == 'u'; }
+};
+template <> struct dtype_traits<PoolDType::FP8_E5M2> {
+    using ctype = __nv_fp8_e5m2;
+    static constexpr const char* name = "fp8_e5m2";
+    static constexpr size_t itemsize = 1;
+    static constexpr char np_kind = 'u';
+    static bool validate_np_kind(char k) { return k == 'u'; }
+};
+template <> struct dtype_traits<PoolDType::I8> {
+    using ctype = int8_t;
+    static constexpr const char* name = "i8";
+    static constexpr size_t itemsize = 1;
+    static constexpr char np_kind = 'i';
+    static bool validate_np_kind(char k) { return k == 'i'; }
+};
+template <> struct dtype_traits<PoolDType::I16> {
+    using ctype = int16_t;
+    static constexpr const char* name = "i16";
+    static constexpr size_t itemsize = 2;
+    static constexpr char np_kind = 'i';
+    static bool validate_np_kind(char k) { return k == 'i'; }
+};
