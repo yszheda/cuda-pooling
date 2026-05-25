@@ -183,6 +183,9 @@ py::array_t<float> maxpool2d_f32(
         case 14:
             maxpool_v14(d_input, d_output, params, 0);
             break;
+        case 15:
+            maxpool_v15(d_input, d_output, params, 0);
+            break;
         default:
             throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
     }
@@ -283,6 +286,9 @@ py::array maxpool2d_f16(
             break;
         case 14:
             maxpool_v14(d_input, d_output, params, 0);
+            break;
+        case 15:
+            maxpool_v15(d_input, d_output, params, 0);
             break;
         default:
             throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
@@ -409,6 +415,9 @@ py::array_t<float> avgpool2d_f32(
         case 14:
             avgpool_v14(d_input, d_output, params, 0);
             break;
+        case 15:
+            avgpool_v15(d_input, d_output, params, 0);
+            break;
         default:
             throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
     }
@@ -512,6 +521,9 @@ py::array avgpool2d_f16(
         case 14:
             avgpool_v14(d_input, d_output, params, 0);
             break;
+        case 15:
+            avgpool_v15(d_input, d_output, params, 0);
+            break;
         default:
             throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
     }
@@ -564,6 +576,7 @@ static float maxpool_launch_timed(
         case 12: maxpool_v12(d_input, d_output, params, stream); break;
         case 13: maxpool_v13(d_input, d_output, params, stream); break;
         case 14: maxpool_v14(d_input, d_output, params, stream); break;
+        case 15: maxpool_v15(d_input, d_output, params, stream); break;
         default:
             CUDA_CHECK(cudaEventDestroy(start));
             CUDA_CHECK(cudaEventDestroy(stop));
@@ -604,6 +617,7 @@ static float maxpool_launch_timed(
         case 12: maxpool_v12(d_input, d_output, params, stream); break;
         case 13: maxpool_v13(d_input, d_output, params, stream); break;
         case 14: maxpool_v14(d_input, d_output, params, stream); break;
+        case 15: maxpool_v15(d_input, d_output, params, stream); break;
         default:
             CUDA_CHECK(cudaEventDestroy(start));
             CUDA_CHECK(cudaEventDestroy(stop));
@@ -744,6 +758,7 @@ static float avgpool_launch_timed(
         case 12: avgpool_v12(d_input, d_output, params, stream); break;
         case 13: avgpool_v13(d_input, d_output, params, stream); break;
         case 14: avgpool_v14(d_input, d_output, params, stream); break;
+        case 15: avgpool_v15(d_input, d_output, params, stream); break;
         default:
             CUDA_CHECK(cudaEventDestroy(start));
             CUDA_CHECK(cudaEventDestroy(stop));
@@ -784,6 +799,7 @@ static float avgpool_launch_timed(
         case 12: avgpool_v12(d_input, d_output, params, stream); break;
         case 13: avgpool_v13(d_input, d_output, params, stream); break;
         case 14: avgpool_v14(d_input, d_output, params, stream); break;
+        case 15: avgpool_v15(d_input, d_output, params, stream); break;
         default:
             CUDA_CHECK(cudaEventDestroy(start));
             CUDA_CHECK(cudaEventDestroy(stop));

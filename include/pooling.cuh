@@ -137,3 +137,9 @@ void maxpool_v14(const float* input, float* output, const PoolParams& params, cu
 void maxpool_v14(const half* input, half* output, const PoolParams& params, cudaStream_t stream);
 void avgpool_v14(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream);
 void avgpool_v14(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream);
+
+// v15: swizzled shared memory
+void maxpool_v15(const float* input, float* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v15(const half* input, half* output, const PoolParams& params, cudaStream_t stream);
+void avgpool_v15(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v15(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream);

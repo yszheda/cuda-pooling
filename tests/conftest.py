@@ -12,8 +12,8 @@ TOLERANCES = {
     np.float16: 1e-3,
 }
 
-MAXPOOL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14]
-AVGPOOL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14]
+MAXPOOL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15]
+AVGPOOL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15]
 MAPPING_VERSIONS = [0, 1, 2, 3]
 
 # v9 requires SM90+ for TMA/cp.async — test separately with skip
