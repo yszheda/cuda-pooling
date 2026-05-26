@@ -373,3 +373,112 @@ Based on the profiling data:
 4. **v1, v5, v6 should be removed** from production use — they never beat v0/v2 and add complexity. v5 specifically is architecturally broken without cp.async support (see deep analysis above).
 5. **v7mD** is a reasonable alternative to v2 for medium/large spatial dims with C%4==0.
 6. **Future work**: Implement async-pipeline based double buffering using `cp.async` / `__pipeline_memcpy_async` to actually overlap memory and compute. The current v5 is architecturally broken without this — it uses 2x smem for zero pipelining benefit (see deep analysis).
+
+## Multi-Dtype Performance Analysis (A40 SM 86 / Thor SM 110)
+
+### Environment
+
+- **GPU**: NVIDIA Thor (SM 11.0, Blackwell, GB10B) / NVIDIA A40 (SM 8.6, Ampere)
+- **CUDA**: 13.0 / 13.1
+- **Data Types**: fp32, fp16, bf16, fp8_e4m3, fp8_e5m2, int8, int16
+- **Timing**: CUDA events (kernel-only, excluding H2D/D2H transfers)
+
+### Benchmark Configuration
+
+| Config | Shape | Pool | k | s | p |
+|--------|-------|------|---|---|---|
+| mem_bound | (1, 128, 128, 256) | max | 3 | 2 | 1 |
+| global_avg | (1, 7, 7, 512) | avg | 7 | 1 | 0 |
+| dense_3x3s1 | (1, 56, 56, 64) | max | 3 | 1 | 1 |
+| large_k13 | (1, 32, 32, 64) | max | 13 | 1 | 6 |
+
+### Cross-Dtype Summary (Thor SM 110, warmup=5, iters=20)
+
+#### mem_bound — (1, 128, 128, 256) max 3x3s2p1
+
+| Dtype | v0 (ms) | Best (ms) | Best Ver | Speedup | v0 BW (GB/s) |
+|-------|---------|-----------|----------|---------|--------------|
+| fp32 | 11.39 | 3.09 | v2 | 3.69x | 1.47 |
+| bf16 | 11.59 | 5.85 | v10 | 1.98x | 0.72 |
+| int16 | 11.64 | 1.44 | v14 | 8.08x | 0.72 |
+| fp8_e4m3 | 13.04 | 13.04 | v0 | 1.00x | 0.32 |
+| fp8_e5m2 | 13.04 | 13.04 | v8 | 1.00x | 0.32 |
+| int8 | 13.10 | 1.68 | v8 | 7.77x | 0.32 |
+| fp16 | 14.85 | 8.68 | v8 | 1.71x | 0.56 |
+
+#### global_avg — (1, 7, 7, 512) avg 7x7s1p0
+
+| Dtype | v0 (ms) | Best (ms) | Best Ver | Speedup | v0 BW (GB/s) |
+|-------|---------|-----------|----------|---------|--------------|
+| fp32 | 0.46 | 0.16 | v14 | 2.78x | 0.22 |
+| bf16 | 0.46 | 0.46 | v0 | 1.00x | 0.11 |
+| int16 | 0.47 | 0.47 | v0 | 1.00x | 0.11 |
+
+#### dense_3x3s1 — (1, 56, 56, 64) max 3x3s1p1
+
+| Dtype | v0 (ms) | Best (ms) | Best Ver | Speedup | v0 BW (GB/s) |
+|-------|---------|-----------|----------|---------|--------------|
+| fp32 | 2.21 | 0.67 | v2 | 3.30x | 0.36 |
+| bf16 | 2.24 | 1.19 | v2 | 1.89x | 0.18 |
+| int16 | 2.25 | 0.36 | v10 | 6.20x | 0.18 |
+
+#### large_k13 — (1, 32, 32, 64) max 13x13s1p6
+
+| Dtype | v0 (ms) | Best (ms) | Best Ver | Speedup | v0 BW (GB/s) |
+|-------|---------|-----------|----------|---------|--------------|
+| fp32 | 5.27 | 1.86 | v2 | 2.84x | 0.05 |
+| bf16 | 5.39 | 2.26 | v15 | 2.39x | 0.02 |
+| int16 | 5.39 | 0.18 | v2 | 30.5x | 0.02 |
+
+### Key Observations
+
+#### fp32 (float32)
+- **Best overall performer** with 2.8-3.7x speedup from v2 vectorized loads
+- v2/v8/v10/v14 all achieve equivalent performance (~3.09 ms for mem_bound)
+- v4 (warp reduce) and v11 are 10-15x slower due to occupancy collapse
+- Global pooling: v14 (adaptive dispatcher) wins with 2.78x
+
+#### bf16 (bfloat16)
+- Similar performance profile to fp32 but 2x slower due to 2-byte elements
+- v2 gives ~2x speedup (vectorized nv_bfloat162 loads)
+- No optimized kernels yet for bf16 (most versions fall back to v0 behavior)
+- Global pooling: no improvement over v0
+
+#### int16 (int16)
+- **Most optimized dtype** — up to 30x speedup with v2/v10/v14
+- int4 vectorized loads (128-bit) provide excellent bandwidth utilization
+- v14 adaptive dispatcher wins for large kernels (13x13: 30.5x speedup)
+- Global pooling: no improvement over v0 (same as fp32/bf16)
+
+#### int8 (int8)
+- v0 baseline is ~13 ms (slower than fp32 due to scalar-like memory access)
+- v2/v8/v14 provide 7.7x speedup for mem_bound
+- **v7m3 crashes** with "misaligned address" — pre-existing kernel bug blocking other configs
+- int4 (128-bit) vectorized loads should be effective once v7m3 is fixed
+
+#### fp8_e4m3 / fp8_e5m2
+- v0 baseline ~13 ms (similar to int8, 1-byte elements)
+- **No optimization benefit yet** — all versions perform similarly to v0
+- Vectorized load traits for fp8 are not yet implemented (scalar loads only)
+- **v7m3 crashes** with "misaligned address" — pre-existing kernel bug blocking other configs
+- SM89+ hardware fp8 instructions not yet utilized
+
+#### fp16 (float16)
+- v0 baseline ~15-16 ms (slowest among all dtypes for mem_bound)
+- v8 provides 1.7x speedup
+- No timed variants available (uses wall-clock timing via perf_counter)
+- **v9+ kernels crash** with "illegal memory access" — pre-existing bug on Thor
+- **v7m3 crashes** with "misaligned address"
+
+### Known Kernel Bugs (Pre-existing)
+
+1. **v7m3 "misaligned address"**: Affects fp8_e4m3, fp8_e5m2, int8, int16, fp16. Blocks execution of configs after mem_bound in single-process benchmarks.
+2. **fp16 v9+ "illegal memory access"**: Thor-specific. Crashes during mem_bound v9+, corrupting CUDA context for all subsequent work.
+3. **fp8/int8 context corruption**: After v7m3 crash, the CUDA context is unusable. Requires subprocess isolation or context reset to continue.
+
+### Benchmarks Infrastructure
+
+- `bench_multidtype.py`: Main orchestrator — runs each dtype in isolated subprocess to avoid CUDA context pollution
+- `bench_dtype.py`: Worker — benchmarks one dtype across all versions and configs, outputs JSON
+- `start_new_session=True`: Used for subprocess creation to avoid inheriting parent's CUDA state
+- fp16 runs last in dtype order since its kernel crashes corrupt shared CUDA state
