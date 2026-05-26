@@ -4,6 +4,8 @@
 #include <cmath>
 #include <stdexcept>
 #include <type_traits>
+#include <mutex>
+#include <unordered_map>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -147,6 +149,189 @@ void avgpool_v15(const float* input, float* output, const AvgPoolParams& params,
 void avgpool_v15(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// bfloat16 kernel declarations (v0-v15)
+// ---------------------------------------------------------------------------
+void maxpool_v0(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v1(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v2(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v3(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v4(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v5(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v6(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v7(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, int mapping, cudaStream_t stream);
+void maxpool_v8(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v9(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v10(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v11(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v12(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v13(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v14(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v15(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams& params, cudaStream_t stream);
+
+void avgpool_v0(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v1(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v2(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v3(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v4(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v5(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v6(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v7(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, int mapping, cudaStream_t stream);
+void avgpool_v8(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v9(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v10(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v11(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v12(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v13(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v14(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v15(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolParams& params, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// int8 kernel declarations (v0-v15)
+// ---------------------------------------------------------------------------
+void maxpool_v0(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v1(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v2(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v3(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v4(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v5(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v6(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v7(const int8_t* input, int8_t* output, const PoolParams& params, int mapping, cudaStream_t stream);
+void maxpool_v8(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v9(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v10(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v11(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v12(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v13(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v14(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v15(const int8_t* input, int8_t* output, const PoolParams& params, cudaStream_t stream);
+
+void avgpool_v0(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v1(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v2(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v3(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v4(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v5(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v6(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v7(const int8_t* input, int8_t* output, const AvgPoolParams& params, int mapping, cudaStream_t stream);
+void avgpool_v8(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v9(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v10(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v11(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v12(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v13(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v14(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v15(const int8_t* input, int8_t* output, const AvgPoolParams& params, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// int16 kernel declarations (v0-v15)
+// ---------------------------------------------------------------------------
+void maxpool_v0(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v1(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v2(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v3(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v4(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v5(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v6(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v7(const int16_t* input, int16_t* output, const PoolParams& params, int mapping, cudaStream_t stream);
+void maxpool_v8(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v9(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v10(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v11(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v12(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v13(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v14(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v15(const int16_t* input, int16_t* output, const PoolParams& params, cudaStream_t stream);
+
+void avgpool_v0(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v1(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v2(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v3(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v4(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v5(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v6(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v7(const int16_t* input, int16_t* output, const AvgPoolParams& params, int mapping, cudaStream_t stream);
+void avgpool_v8(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v9(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v10(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v11(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v12(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v13(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v14(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v15(const int16_t* input, int16_t* output, const AvgPoolParams& params, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// fp8 kernel declarations (v0-v15)
+// ---------------------------------------------------------------------------
+// Note: fp8 maxpool uses suffixed names (implemented in pooling_max_dtypes.cu)
+void maxpool_v0_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v1_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v2_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v3_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v4_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v5_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v6_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v7_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, int mapping, cudaStream_t stream);
+void maxpool_v8_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v9_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v10_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v11_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v12_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v13_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v14_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v15_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const PoolParams& params, cudaStream_t stream);
+
+void avgpool_v0(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v1(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v2(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v4(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v5(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v6(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v7(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, int mapping, cudaStream_t stream);
+void avgpool_v8(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v9(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v10(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v11(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v12(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v13(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v14(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v15(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream);
+
+void maxpool_v0_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v1_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v2_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v3_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v4_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v5_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v6_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v7_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, int mapping, cudaStream_t stream);
+void maxpool_v8_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v9_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v10_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v11_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v12_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v13_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v14_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+void maxpool_v15_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const PoolParams& params, cudaStream_t stream);
+
+void avgpool_v0(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v1(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v3(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v4(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v5(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v6(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v7(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, int mapping, cudaStream_t stream);
+void avgpool_v8(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v9(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v10(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v11(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v12(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v13(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v14(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+void avgpool_v15(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // dtype traits for pybind template instantiation
 // ---------------------------------------------------------------------------
 enum class PoolDType { F32, F16, BF16, FP8_E4M3, FP8_E5M2, I8, I16 };
@@ -202,3 +387,71 @@ template <> struct dtype_traits<PoolDType::I16> {
     static constexpr char np_kind = 'i';
     static bool validate_np_kind(char k) { return k == 'i'; }
 };
+
+// ---------------------------------------------------------------------------
+// Internal kernel templates (used by multi-dtype compilation units)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Internal kernel template declarations (cross-TU visibility for dtype files)
+// ---------------------------------------------------------------------------
+
+// Maxpool template kernels (defined in pooling_max.cu, used by dtype files)
+template <typename T>
+__global__ void maxpool_v0_kernel(const T* __restrict__ input, T* __restrict__ output, const PoolParams params);
+template <typename T, int BLOCK>
+__global__ void maxpool_v3_kernel(const T* __restrict__ input, T* __restrict__ output, const PoolParams params);
+template <typename T>
+__global__ void maxpool_v4_kernel(const T* __restrict__ input, T* __restrict__ output, const PoolParams params);
+
+// Avgpool template kernels (defined in pooling_avg.cu, used by dtype files)
+template <typename T>
+__global__ void avgpool_v0_kernel(const T* __restrict__ input, T* __restrict__ output, const AvgPoolParams params);
+template <typename T, int BLOCK>
+__global__ void avgpool_v3_kernel(const T* __restrict__ input, T* __restrict__ output, const AvgPoolParams params);
+template <typename T>
+__global__ void avgpool_v4_kernel(const T* __restrict__ input, T* __restrict__ output, const AvgPoolParams params);
+
+// v7 mapping kernels (maxpool) — PoolParams variants
+template <typename T>
+__global__ void maxpool_v7_mappingB_kernel(
+    const T* __restrict__ input, T* __restrict__ output,
+    const PoolParams params, int C_groups);
+template <typename T>
+__global__ void maxpool_v7_mappingC_kernel(
+    const T* __restrict__ input, T* __restrict__ output,
+    const PoolParams params, int C_groups);
+template <typename T>
+__global__ void maxpool_v7_mappingD_kernel(
+    const T* __restrict__ input, T* __restrict__ output,
+    const PoolParams params, int C_groups);
+
+// v7 mapping kernels (avgpool) — AvgPoolParams variants
+template <typename T>
+__global__ void avgpool_v7_mappingB_kernel(
+    const T* __restrict__ input, T* __restrict__ output,
+    const AvgPoolParams params, int C_groups);
+template <typename T>
+__global__ void avgpool_v7_mappingC_kernel(
+    const T* __restrict__ input, T* __restrict__ output,
+    const AvgPoolParams params, int C_groups);
+template <typename T>
+__global__ void avgpool_v7_mappingD_kernel(
+    const T* __restrict__ input, T* __restrict__ output,
+    const AvgPoolParams params, int C_groups);
+
+// v8 auto-tune helpers (shared across maxpool dtypes)
+struct TileConfig { int tile_oh; int tile_ow; };
+uint64_t v8_hash_key(int H, int W, int C, int kh, int kw, int sh, int sw, int ph, int pw);
+TileConfig v8_heuristic_tile(const PoolParams& params);
+extern std::mutex v8_cache_mutex;
+extern std::unordered_map<uint64_t, TileConfig> v8_cache;
+
+// v15 swizzled shared memory kernel (used by both maxpool and avgpool)
+template <typename T, bool IS_MAXPOOL, bool COUNT_INCLUDE_PAD = true>
+__global__ void maxpool_v15_kernel(
+    const T* __restrict__ input, T* __restrict__ output,
+    const PoolParams params, int blocks_oh, int blocks_ow, int smem_h, int smem_w);
+
+// Utility
+PoolParams make_pool_params_from_avg(const AvgPoolParams& p);

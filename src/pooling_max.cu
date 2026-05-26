@@ -1340,7 +1340,7 @@ void maxpool_v7(const float* input, float* output, const PoolParams& params, int
 // Falls back to v2 for aligned-C cases (vectorized loads outperform tiling).
 // ============================================================================
 
-struct TileConfig { int tile_oh; int tile_ow; };
+// TileConfig is defined in pooling.cuh
 static const TileConfig V8_TILE_CANDIDATES[] = {
     {8, 8}, {16, 16}, {32, 8}, {8, 32}, {16, 8},
     {8, 16}, {32, 4}, {4, 32}, {64, 4},
@@ -1348,7 +1348,7 @@ static const TileConfig V8_TILE_CANDIDATES[] = {
 static const int V8_NUM_CANDIDATES = 9;
 
 // Simple FNV-1a hash for cache key
-static uint64_t v8_hash_key(int64_t H, int64_t W, int64_t C, int kh, int kw, int sh, int sw, int ph, int pw) {
+uint64_t v8_hash_key(int H, int W, int C, int kh, int kw, int sh, int sw, int ph, int pw) {
     uint64_t hash = 0xcbf29ce484222325ULL;
     const uint64_t prime = 0x00000100000001b3ULL;
     int64_t vals[] = {H, W, C, (int64_t)kh, (int64_t)kw, (int64_t)sh, (int64_t)sw, (int64_t)ph, (int64_t)pw};
@@ -1360,8 +1360,8 @@ static uint64_t v8_hash_key(int64_t H, int64_t W, int64_t C, int kh, int kw, int
 }
 
 // Global auto-tune cache (thread-safe via mutex)
-static std::mutex v8_cache_mutex;
-static std::unordered_map<uint64_t, TileConfig> v8_cache;
+std::mutex v8_cache_mutex;
+std::unordered_map<uint64_t, TileConfig> v8_cache;
 
 template <int TILE_OH, int TILE_OW, typename T>
 __global__ void maxpool_v8_kernel(
@@ -1532,7 +1532,7 @@ static void v8_launch_config(const T* d_input, T* d_output, const PoolParams& pa
 }
 
 // Heuristic tile selection (no auto-tuning)
-static TileConfig v8_heuristic_tile(const PoolParams& params) {
+TileConfig v8_heuristic_tile(const PoolParams& params) {
     if (params.sh == 1 && params.OH > 64 && params.OW > 64)
         return {16, 16};
     if (params.sh >= 2)
@@ -2527,117 +2527,10 @@ void maxpool_v14(const half* input, half* output, const PoolParams& params, cuda
 
 // Shared memory swizzle: XOR-based permutation to spread bank-conflicting
 // accesses across different banks. For fp32 (4-byte), 8 consecutive columns
-// map to the same SMEM bank. This swizzle shifts them to different rows.
-// V15 swizzled shared memory: use column padding to break 8-way bank conflicts.
-// For fp32 (4-byte), elements at columns 0,8,16,... hit the same bank.
-// By allocating smem_w+1 columns (padding), element (row, col) maps to
-// row*(smem_w+1) + col, so consecutive columns are always in different banks.
-template <typename T>
-__device__ __forceinline__ int v15_smem_idx(int row, int col, int smem_w_padded) {
-    return row * smem_w_padded + col;
-}
-
-template <typename T, bool IS_MAXPOOL, bool COUNT_INCLUDE_PAD = true>
-__global__ void maxpool_v15_kernel(const T* __restrict__ input, T* __restrict__ output,
-                                   const PoolParams params,
-                                   int blocks_oh, int blocks_ow,
-                                   int smem_h, int smem_w)
-{
-    constexpr int TILE_OH = 8;
-    constexpr int TILE_OW = 8;
-
-    const int n = blockIdx.z;
-    const int c = blockIdx.y;
-    const int tile_idx = blockIdx.x;
-    const int tile_oh = tile_idx / blocks_ow;
-    const int tile_ow = tile_idx % blocks_ow;
-
-    const int th = threadIdx.y;
-    const int tw = threadIdx.x;
-
-    // Pad columns by 1 to break bank conflicts
-    const int smem_w_padded = smem_w + 1;
-
-    extern __shared__ __align__(16) unsigned char smem_raw[];
-    T* smem = reinterpret_cast<T*>(smem_raw);
-
-    const int oh = tile_oh * TILE_OH + th;
-    const int ow = tile_ow * TILE_OW + tw;
-
-    const int ih_start = tile_oh * TILE_OH * params.sh - params.ph;
-    const int iw_start = tile_ow * TILE_OW * params.sw - params.pw;
-
-    // Cooperative loading into padded shared memory
-    const int total_smem = smem_h * smem_w;
-    const int tid = th * TILE_OW + tw;
-    for (int i = tid; i < total_smem; i += TILE_OH * TILE_OW) {
-        const int sih = i / smem_w;
-        const int siw = i % smem_w;
-        const int ih = ih_start + sih;
-        const int iw = iw_start + siw;
-        T val = IS_MAXPOOL ? static_cast<T>(-INFINITY) : static_cast<T>(0);
-        if (ih >= 0 && ih < params.H && iw >= 0 && iw < params.W) {
-            const int64_t in_idx = ((static_cast<int64_t>(n) * params.H + ih) * params.W + iw) * params.C + c;
-            val = input[in_idx];
-        }
-        smem[v15_smem_idx<T>(sih, siw, smem_w_padded)] = val;
-    }
-
-    __syncthreads();
-
-    if (oh >= params.OH || ow >= params.OW) return;
-
-    T result_max = static_cast<T>(-INFINITY);
-    float result_avg = 0.0f;
-    int count = 0;
-    for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
-        const int sih = th * params.sh + kh_i * params.dh;
-        for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
-            const int siw = tw * params.sw + kw_i * params.dw;
-            T val = smem[v15_smem_idx<T>(sih, siw, smem_w_padded)];
-            if constexpr (IS_MAXPOOL) {
-                if constexpr (std::is_same<T, half>::value) {
-                    result_max = __hmax(result_max, val);
-                } else {
-                    result_max = max(result_max, val);
-                }
-            } else {
-                result_avg += static_cast<float>(val);
-                if constexpr (COUNT_INCLUDE_PAD) {
-                    // Check if this position is from explicit padding (ph/pw > 0)
-                    // or implicit ceil-boundary padding.
-                    // Only count explicit padding in the divisor.
-                    int ih_coord = tile_oh * TILE_OH * params.sh - params.ph + th * params.sh + kh_i * params.dh;
-                    int iw_coord = tile_ow * TILE_OW * params.sw - params.pw + tw * params.sw + kw_i * params.dw;
-                    // Explicit padding: coord is in the padding zone (-ph <= coord < 0 or H <= coord < H+ph)
-                    // Implicit ceil padding: coord < -ph or coord >= H+ph
-                    // For explicit padding, count it. For implicit (ceil boundary), don't count it.
-                    if (ih_coord >= -params.ph && ih_coord < params.H + params.ph &&
-                        iw_coord >= -params.pw && iw_coord < params.W + params.pw) {
-                        count++;
-                    }
-                } else {
-                    // Only count valid (non-padding) positions
-                    int ih_coord = tile_oh * TILE_OH * params.sh - params.ph + th * params.sh + kh_i * params.dh;
-                    int iw_coord = tile_ow * TILE_OW * params.sw - params.pw + tw * params.sw + kw_i * params.dw;
-                    if (ih_coord >= 0 && ih_coord < params.H && iw_coord >= 0 && iw_coord < params.W) {
-                        count++;
-                    }
-                }
-            }
-        }
-    }
-
-    int64_t out_idx = ((static_cast<int64_t>(n) * params.OH + oh) * params.OW + ow) * params.C + c;
-    if constexpr (IS_MAXPOOL) {
-        output[out_idx] = result_max;
-    } else {
-        output[out_idx] = static_cast<T>(result_avg / count);
-    }
-}
+#include "maxpool_v15_kernel.cuh"
 
 // Helper: convert AvgPoolParams to PoolParams (for v15 shared kernel template)
-static PoolParams make_pool_params_from_avg(const AvgPoolParams& p) {
+PoolParams make_pool_params_from_avg(const AvgPoolParams& p) {
     PoolParams r;
     r.N = p.N; r.H = p.H; r.W = p.W; r.C = p.C;
     r.kh = p.kh; r.kw = p.kw; r.sh = p.sh; r.sw = p.sw;
@@ -2703,78 +2596,5 @@ void maxpool_v15(const half* input, half* output, const PoolParams& params, cuda
     NVTX_RANGE_POP();
 }
 
-void avgpool_v15(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
-    NVTX_RANGE_PUSH_C("avgpool_v15_f32", NVTX_COLOR_AVGPOOL);
-    constexpr int TILE_OH = 8;
-    constexpr int TILE_OW = 8;
-
-    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
-    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
-
-    // smem must cover worst-case compute access; load already guards OOB reads
-    int smem_h = (TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1;
-    int smem_w = (TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1;
-    // +1 column padding to break bank conflicts
-    size_t smem_bytes = static_cast<size_t>(smem_h) * (smem_w + 1) * sizeof(float);
-
-    PoolParams pp = make_pool_params_from_avg(params);
-    dim3 block(TILE_OW, TILE_OH);
-    dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
-
-    if (smem_bytes > 49152) {
-        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v15_kernel<float, false, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
-        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v15_kernel<float, false, false>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
-    }
-
-    if (params.count_include_pad) {
-        maxpool_v15_kernel<float, false, true><<<grid, block, smem_bytes, stream>>>(
-            reinterpret_cast<const float*>(input), reinterpret_cast<float*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
-    } else {
-        maxpool_v15_kernel<float, false, false><<<grid, block, smem_bytes, stream>>>(
-            reinterpret_cast<const float*>(input), reinterpret_cast<float*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
-    }
-    CUDA_CHECK(cudaGetLastError());
-    NVTX_RANGE_POP();
-}
-
-void avgpool_v15(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
-    NVTX_RANGE_PUSH_C("avgpool_v15_f16", NVTX_COLOR_AVGPOOL);
-    constexpr int TILE_OH = 8;
-    constexpr int TILE_OW = 8;
-
-    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
-    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
-
-    // smem must cover worst-case compute access; load already guards OOB reads
-    int smem_h = (TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1;
-    int smem_w = (TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1;
-    // +1 column padding to break bank conflicts
-    size_t smem_bytes = static_cast<size_t>(smem_h) * (smem_w + 1) * sizeof(half);
-
-    PoolParams pp = make_pool_params_from_avg(params);
-    dim3 block(TILE_OW, TILE_OH);
-    dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
-
-    if (smem_bytes > 49152) {
-        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v15_kernel<half, false, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
-        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v15_kernel<half, false, false>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
-    }
-
-    if (params.count_include_pad) {
-        maxpool_v15_kernel<half, false, true><<<grid, block, smem_bytes, stream>>>(
-            reinterpret_cast<const half*>(input), reinterpret_cast<half*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
-    } else {
-        maxpool_v15_kernel<half, false, false><<<grid, block, smem_bytes, stream>>>(
-            reinterpret_cast<const half*>(input), reinterpret_cast<half*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
-    }
-    CUDA_CHECK(cudaGetLastError());
-    NVTX_RANGE_POP();
-}
+// Include dtype implementations in this TU so template kernels are visible for all types
+#include "pooling_max_dtypes.cu"

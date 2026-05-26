@@ -2761,3 +2761,72 @@ void avgpool_v14(const half* input, half* output, const AvgPoolParams& params, c
     avgpool_v2(input, output, params, stream);
     NVTX_RANGE_POP();
 }
+
+// ============================================================================
+// AvgPool2d v15: swizzled shared memory kernel
+// Reuses maxpool_v15_kernel template with IS_MAXPOOL=false
+// ============================================================================
+
+void avgpool_v15(const float* input, float* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v15_f32", NVTX_COLOR_AVGPOOL);
+    constexpr int TILE_OH = 8;
+    constexpr int TILE_OW = 8;
+    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
+    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
+    int smem_h = (TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1;
+    int smem_w = (TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1;
+    size_t smem_bytes = static_cast<size_t>(smem_h) * (smem_w + 1) * sizeof(float);
+    PoolParams pp = make_pool_params_from_avg(params);
+    dim3 block(TILE_OW, TILE_OH);
+    dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v15_kernel<float, false, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v15_kernel<float, false, false>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+    }
+    if (params.count_include_pad) {
+        maxpool_v15_kernel<float, false, true><<<grid, block, smem_bytes, stream>>>(
+            input, output, pp, blocks_oh, blocks_ow, smem_h, smem_w);
+    } else {
+        maxpool_v15_kernel<float, false, false><<<grid, block, smem_bytes, stream>>>(
+            input, output, pp, blocks_oh, blocks_ow, smem_h, smem_w);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
+}
+
+void avgpool_v15(const half* input, half* output, const AvgPoolParams& params, cudaStream_t stream) {
+    NVTX_RANGE_PUSH_C("avgpool_v15_f16", NVTX_COLOR_AVGPOOL);
+    constexpr int TILE_OH = 8;
+    constexpr int TILE_OW = 8;
+    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
+    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
+    int smem_h = (TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1;
+    int smem_w = (TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1;
+    size_t smem_bytes = static_cast<size_t>(smem_h) * (smem_w + 1) * sizeof(float);
+    PoolParams pp = make_pool_params_from_avg(params);
+    dim3 block(TILE_OW, TILE_OH);
+    dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
+    if (smem_bytes > 49152) {
+        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v15_kernel<half, false, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v15_kernel<half, false, false>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+    }
+    if (params.count_include_pad) {
+        maxpool_v15_kernel<half, false, true><<<grid, block, smem_bytes, stream>>>(
+            input, output, pp, blocks_oh, blocks_ow, smem_h, smem_w);
+    } else {
+        maxpool_v15_kernel<half, false, false><<<grid, block, smem_bytes, stream>>>(
+            input, output, pp, blocks_oh, blocks_ow, smem_h, smem_w);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    NVTX_RANGE_POP();
+}
+
+// V15 kernel template definition (shared with pooling_max.cu)
+#include "maxpool_v15_kernel.cuh"
+
+// Include dtype implementations in this TU so template kernels are visible for all types
+#include "pooling_avg_dtypes.cu"

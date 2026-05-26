@@ -497,6 +497,513 @@ py::tuple avgpool2d_timed_f32(
     return py::make_tuple(output, elapsed_ms);
 }
 
+// FP8 avgpool: now uses non-suffixed names matching the generic dispatch_avgpool<T>.
+// FP8 maxpool: uses suffixed names from pooling_max_dtypes.cu, handled by dispatch_maxpool_fp8.
+
+template <typename T>
+void dispatch_maxpool_fp8(const T* d_in, T* d_out, const PoolParams& params, int version, int mapping, cudaStream_t stream);
+
+template <>
+void dispatch_maxpool_fp8(const __nv_fp8_e4m3* d_in, __nv_fp8_e4m3* d_out, const PoolParams& params, int version, int mapping, cudaStream_t stream) {
+    switch (version) {
+        case 0: maxpool_v0_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 1: maxpool_v1_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 2: maxpool_v2_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 3: maxpool_v3_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 4: maxpool_v4_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 5: maxpool_v5_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 6: maxpool_v6_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 7: maxpool_v7_fp8_e4m3(d_in, d_out, params, mapping, stream); break;
+        case 8: maxpool_v8_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 9: maxpool_v9_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 10: maxpool_v10_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 11: maxpool_v11_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 12: maxpool_v12_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 13: maxpool_v13_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 14: maxpool_v14_fp8_e4m3(d_in, d_out, params, stream); break;
+        case 15: maxpool_v15_fp8_e4m3(d_in, d_out, params, stream); break;
+        default:
+            throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
+    }
+}
+
+template <>
+void dispatch_maxpool_fp8(const __nv_fp8_e5m2* d_in, __nv_fp8_e5m2* d_out, const PoolParams& params, int version, int mapping, cudaStream_t stream) {
+    switch (version) {
+        case 0: maxpool_v0_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 1: maxpool_v1_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 2: maxpool_v2_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 3: maxpool_v3_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 4: maxpool_v4_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 5: maxpool_v5_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 6: maxpool_v6_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 7: maxpool_v7_fp8_e5m2(d_in, d_out, params, mapping, stream); break;
+        case 8: maxpool_v8_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 9: maxpool_v9_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 10: maxpool_v10_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 11: maxpool_v11_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 12: maxpool_v12_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 13: maxpool_v13_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 14: maxpool_v14_fp8_e5m2(d_in, d_out, params, stream); break;
+        case 15: maxpool_v15_fp8_e5m2(d_in, d_out, params, stream); break;
+        default:
+            throw std::invalid_argument("unsupported kernel version: " + std::to_string(version));
+    }
+}
+
+// Forward dispatch_maxpool<__nv_fp8_*> to dispatch_maxpool_fp8
+template <>
+inline void dispatch_maxpool(const __nv_fp8_e4m3* d_in, __nv_fp8_e4m3* d_out, const PoolParams& params, int version, int mapping, cudaStream_t stream) {
+    dispatch_maxpool_fp8(d_in, d_out, params, version, mapping, stream);
+}
+
+template <>
+inline void dispatch_maxpool(const __nv_fp8_e5m2* d_in, __nv_fp8_e5m2* d_out, const PoolParams& params, int version, int mapping, cudaStream_t stream) {
+    dispatch_maxpool_fp8(d_in, d_out, params, version, mapping, stream);
+}
+
+// ---------------------------------------------------------------------------
+// FP8 maxpool timed launch helper
+// ---------------------------------------------------------------------------
+template <typename T>
+static float maxpool_fp8_launch_timed(const T* d_in, T* d_out, const PoolParams& params, int version, int mapping, cudaStream_t stream) {
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start, stream));
+    dispatch_maxpool_fp8(d_in, d_out, params, version, mapping, stream);
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return elapsed_ms;
+}
+
+// ---------------------------------------------------------------------------
+// Dtype-specific bindings
+// ---------------------------------------------------------------------------
+
+// --- bfloat16 (uint16 view) ---
+py::array maxpool2d_bf16(
+    py::array input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, int version, int mapping)
+{
+    validate_dtype(input, 'u', 2, "uint16 (bfloat16 view)");
+    return maxpool2d_raw<nv_bfloat16>(input, kernel_size, stride, padding, dilation, ceil_mode, version, mapping, "uint16");
+}
+
+py::array avgpool2d_bf16(
+    py::array input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, bool count_include_pad,
+    const py::object& divisor_override, int version, int mapping)
+{
+    validate_dtype(input, 'u', 2, "uint16 (bfloat16 view)");
+    return avgpool2d_raw<nv_bfloat16>(input, kernel_size, stride, padding, dilation, ceil_mode, count_include_pad, divisor_override, version, mapping, "uint16");
+}
+
+// --- int8 ---
+py::array_t<int8_t> maxpool2d_i8(
+    py::array_t<int8_t, py::array::c_style | py::array::forcecast> input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, int version, int mapping)
+{
+    return maxpool2d_typed<int8_t>(input, kernel_size, stride, padding, dilation, ceil_mode, version, mapping);
+}
+
+py::array_t<int8_t> avgpool2d_i8(
+    py::array_t<int8_t, py::array::c_style | py::array::forcecast> input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, bool count_include_pad,
+    const py::object& divisor_override, int version, int mapping)
+{
+    return avgpool2d_typed<int8_t>(input, kernel_size, stride, padding, dilation, ceil_mode, count_include_pad, divisor_override, version, mapping);
+}
+
+// --- int16 ---
+py::array_t<int16_t> maxpool2d_i16(
+    py::array_t<int16_t, py::array::c_style | py::array::forcecast> input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, int version, int mapping)
+{
+    return maxpool2d_typed<int16_t>(input, kernel_size, stride, padding, dilation, ceil_mode, version, mapping);
+}
+
+py::array_t<int16_t> avgpool2d_i16(
+    py::array_t<int16_t, py::array::c_style | py::array::forcecast> input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, bool count_include_pad,
+    const py::object& divisor_override, int version, int mapping)
+{
+    return avgpool2d_typed<int16_t>(input, kernel_size, stride, padding, dilation, ceil_mode, count_include_pad, divisor_override, version, mapping);
+}
+
+// --- fp8 e4m3 (uint8 view) ---
+py::array maxpool2d_fp8_e4m3(
+    py::array input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, int version, int mapping)
+{
+    validate_dtype(input, 'u', 1, "uint8 (fp8_e4m3 view)");
+    return maxpool2d_raw<__nv_fp8_e4m3>(input, kernel_size, stride, padding, dilation, ceil_mode, version, mapping, "uint8");
+}
+
+py::array avgpool2d_fp8_e4m3(
+    py::array input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, bool count_include_pad,
+    const py::object& divisor_override, int version, int mapping)
+{
+    validate_dtype(input, 'u', 1, "uint8 (fp8_e4m3 view)");
+    return avgpool2d_raw<__nv_fp8_e4m3>(input, kernel_size, stride, padding, dilation, ceil_mode, count_include_pad, divisor_override, version, mapping, "uint8");
+}
+
+// --- fp8 e5m2 (uint8 view) ---
+py::array maxpool2d_fp8_e5m2(
+    py::array input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, int version, int mapping)
+{
+    validate_dtype(input, 'u', 1, "uint8 (fp8_e5m2 view)");
+    return maxpool2d_raw<__nv_fp8_e5m2>(input, kernel_size, stride, padding, dilation, ceil_mode, version, mapping, "uint8");
+}
+
+py::array avgpool2d_fp8_e5m2(
+    py::array input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, bool count_include_pad,
+    const py::object& divisor_override, int version, int mapping)
+{
+    validate_dtype(input, 'u', 1, "uint8 (fp8_e5m2 view)");
+    return avgpool2d_raw<__nv_fp8_e5m2>(input, kernel_size, stride, padding, dilation, ceil_mode, count_include_pad, divisor_override, version, mapping, "uint8");
+}
+
+// --- Timed variants for bfloat16 ---
+py::tuple maxpool2d_timed_bf16(
+    py::array input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, int version, int mapping)
+{
+    NVTX_RANGE_PUSH("maxpool2d_timed_bf16");
+    input = ensure_c_contiguous(input);
+    auto shape = array_shape(input);
+    size_t in_nbytes = input.size() * sizeof(nv_bfloat16);
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+    auto params = make_pool_params(shape, kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode);
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+    size_t out_nbytes = out_nelms * sizeof(nv_bfloat16);
+    { std::lock_guard<std::mutex> lock(arena_mutex); arena_in.ensure(in_nbytes); arena_out.ensure(out_nbytes); }
+    nv_bfloat16* d_input = static_cast<nv_bfloat16*>(arena_in.ptr);
+    nv_bfloat16* d_output = static_cast<nv_bfloat16*>(arena_out.ptr);
+    CUDA_CHECK(cudaMemcpy(d_input, input.data(), in_nbytes, cudaMemcpyHostToDevice));
+    float elapsed_ms = maxpool_launch_timed(d_input, d_output, params, version, mapping, 0);
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    py::module_ np = py::module_::import("numpy");
+    auto output = np.attr("empty")(out_shape, np.attr("uint16")).cast<py::array>();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nbytes, cudaMemcpyDeviceToHost));
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
+py::tuple avgpool2d_timed_bf16(
+    py::array input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, bool count_include_pad,
+    const py::object& divisor_override, int version, int mapping)
+{
+    NVTX_RANGE_PUSH("avgpool2d_timed_bf16");
+    input = ensure_c_contiguous(input);
+    auto shape = array_shape(input);
+    size_t in_nbytes = input.size() * sizeof(nv_bfloat16);
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+    int64_t div_over = divisor_override.is_none() ? 0 : divisor_override.cast<int64_t>();
+    auto params = make_avgpool_params(shape, kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode, count_include_pad, div_over);
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+    size_t out_nbytes = out_nelms * sizeof(nv_bfloat16);
+    { std::lock_guard<std::mutex> lock(arena_mutex); arena_in.ensure(in_nbytes); arena_out.ensure(out_nbytes); }
+    nv_bfloat16* d_input = static_cast<nv_bfloat16*>(arena_in.ptr);
+    nv_bfloat16* d_output = static_cast<nv_bfloat16*>(arena_out.ptr);
+    CUDA_CHECK(cudaMemcpy(d_input, input.data(), in_nbytes, cudaMemcpyHostToDevice));
+    float elapsed_ms = avgpool_launch_timed(d_input, d_output, params, version, mapping, 0);
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    py::module_ np = py::module_::import("numpy");
+    auto output = np.attr("empty")(out_shape, np.attr("uint16")).cast<py::array>();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nbytes, cudaMemcpyDeviceToHost));
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
+// --- Timed variants for int8 ---
+py::tuple maxpool2d_timed_i8(
+    py::array_t<int8_t, py::array::c_style | py::array::forcecast> input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, int version, int mapping)
+{
+    NVTX_RANGE_PUSH("maxpool2d_timed_i8");
+    auto buf = input.request();
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+    auto params = make_pool_params(array_shape(input), kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode);
+    size_t in_nelms = buf.size;
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+    { std::lock_guard<std::mutex> lock(arena_mutex); arena_in.ensure(in_nelms * sizeof(int8_t)); arena_out.ensure(out_nelms * sizeof(int8_t)); }
+    int8_t* d_input = static_cast<int8_t*>(arena_in.ptr);
+    int8_t* d_output = static_cast<int8_t*>(arena_out.ptr);
+    CUDA_CHECK(cudaMemcpy(d_input, buf.ptr, in_nelms * sizeof(int8_t), cudaMemcpyHostToDevice));
+    float elapsed_ms = maxpool_launch_timed(d_input, d_output, params, version, mapping, 0);
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    auto output = py::array_t<int8_t>(out_shape);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nelms * sizeof(int8_t), cudaMemcpyDeviceToHost));
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
+py::tuple avgpool2d_timed_i8(
+    py::array_t<int8_t, py::array::c_style | py::array::forcecast> input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, bool count_include_pad,
+    const py::object& divisor_override, int version, int mapping)
+{
+    NVTX_RANGE_PUSH("avgpool2d_timed_i8");
+    auto buf = input.request();
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+    int64_t div_over = divisor_override.is_none() ? 0 : divisor_override.cast<int64_t>();
+    auto params = make_avgpool_params(array_shape(input), kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode, count_include_pad, div_over);
+    size_t in_nelms = buf.size;
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+    { std::lock_guard<std::mutex> lock(arena_mutex); arena_in.ensure(in_nelms * sizeof(int8_t)); arena_out.ensure(out_nelms * sizeof(int8_t)); }
+    int8_t* d_input = static_cast<int8_t*>(arena_in.ptr);
+    int8_t* d_output = static_cast<int8_t*>(arena_out.ptr);
+    CUDA_CHECK(cudaMemcpy(d_input, buf.ptr, in_nelms * sizeof(int8_t), cudaMemcpyHostToDevice));
+    float elapsed_ms = avgpool_launch_timed(d_input, d_output, params, version, mapping, 0);
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    auto output = py::array_t<int8_t>(out_shape);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nelms * sizeof(int8_t), cudaMemcpyDeviceToHost));
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
+// --- Timed variants for int16 ---
+py::tuple maxpool2d_timed_i16(
+    py::array_t<int16_t, py::array::c_style | py::array::forcecast> input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, int version, int mapping)
+{
+    NVTX_RANGE_PUSH("maxpool2d_timed_i16");
+    auto buf = input.request();
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+    auto params = make_pool_params(array_shape(input), kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode);
+    size_t in_nelms = buf.size;
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+    { std::lock_guard<std::mutex> lock(arena_mutex); arena_in.ensure(in_nelms * sizeof(int16_t)); arena_out.ensure(out_nelms * sizeof(int16_t)); }
+    int16_t* d_input = static_cast<int16_t*>(arena_in.ptr);
+    int16_t* d_output = static_cast<int16_t*>(arena_out.ptr);
+    CUDA_CHECK(cudaMemcpy(d_input, buf.ptr, in_nelms * sizeof(int16_t), cudaMemcpyHostToDevice));
+    float elapsed_ms = maxpool_launch_timed(d_input, d_output, params, version, mapping, 0);
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    auto output = py::array_t<int16_t>(out_shape);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nelms * sizeof(int16_t), cudaMemcpyDeviceToHost));
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
+py::tuple avgpool2d_timed_i16(
+    py::array_t<int16_t, py::array::c_style | py::array::forcecast> input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, bool count_include_pad,
+    const py::object& divisor_override, int version, int mapping)
+{
+    NVTX_RANGE_PUSH("avgpool2d_timed_i16");
+    auto buf = input.request();
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+    int64_t div_over = divisor_override.is_none() ? 0 : divisor_override.cast<int64_t>();
+    auto params = make_avgpool_params(array_shape(input), kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode, count_include_pad, div_over);
+    size_t in_nelms = buf.size;
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+    { std::lock_guard<std::mutex> lock(arena_mutex); arena_in.ensure(in_nelms * sizeof(int16_t)); arena_out.ensure(out_nelms * sizeof(int16_t)); }
+    int16_t* d_input = static_cast<int16_t*>(arena_in.ptr);
+    int16_t* d_output = static_cast<int16_t*>(arena_out.ptr);
+    CUDA_CHECK(cudaMemcpy(d_input, buf.ptr, in_nelms * sizeof(int16_t), cudaMemcpyHostToDevice));
+    float elapsed_ms = avgpool_launch_timed(d_input, d_output, params, version, mapping, 0);
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    auto output = py::array_t<int16_t>(out_shape);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nelms * sizeof(int16_t), cudaMemcpyDeviceToHost));
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
+// --- Timed variants for fp8 e4m3 ---
+py::tuple maxpool2d_timed_fp8_e4m3(
+    py::array input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, int version, int mapping)
+{
+    NVTX_RANGE_PUSH("maxpool2d_timed_fp8e4m3");
+    input = ensure_c_contiguous(input);
+    auto shape = array_shape(input);
+    size_t in_nbytes = input.size() * sizeof(__nv_fp8_e4m3);
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+    auto params = make_pool_params(shape, kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode);
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+    size_t out_nbytes = out_nelms * sizeof(__nv_fp8_e4m3);
+    { std::lock_guard<std::mutex> lock(arena_mutex); arena_in.ensure(in_nbytes); arena_out.ensure(out_nbytes); }
+    __nv_fp8_e4m3* d_input = static_cast<__nv_fp8_e4m3*>(arena_in.ptr);
+    __nv_fp8_e4m3* d_output = static_cast<__nv_fp8_e4m3*>(arena_out.ptr);
+    CUDA_CHECK(cudaMemcpy(d_input, input.data(), in_nbytes, cudaMemcpyHostToDevice));
+    float elapsed_ms = maxpool_fp8_launch_timed(d_input, d_output, params, version, mapping, 0);
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    py::module_ np = py::module_::import("numpy");
+    auto output = np.attr("empty")(out_shape, np.attr("uint8")).cast<py::array>();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nbytes, cudaMemcpyDeviceToHost));
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
+py::tuple avgpool2d_timed_fp8_e4m3(
+    py::array input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, bool count_include_pad,
+    const py::object& divisor_override, int version, int mapping)
+{
+    NVTX_RANGE_PUSH("avgpool2d_timed_fp8e4m3");
+    input = ensure_c_contiguous(input);
+    auto shape = array_shape(input);
+    size_t in_nbytes = input.size() * sizeof(__nv_fp8_e4m3);
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+    int64_t div_over = divisor_override.is_none() ? 0 : divisor_override.cast<int64_t>();
+    auto params = make_avgpool_params(shape, kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode, count_include_pad, div_over);
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+    size_t out_nbytes = out_nelms * sizeof(__nv_fp8_e4m3);
+    { std::lock_guard<std::mutex> lock(arena_mutex); arena_in.ensure(in_nbytes); arena_out.ensure(out_nbytes); }
+    __nv_fp8_e4m3* d_input = static_cast<__nv_fp8_e4m3*>(arena_in.ptr);
+    __nv_fp8_e4m3* d_output = static_cast<__nv_fp8_e4m3*>(arena_out.ptr);
+    CUDA_CHECK(cudaMemcpy(d_input, input.data(), in_nbytes, cudaMemcpyHostToDevice));
+    float elapsed_ms = avgpool_launch_timed(d_input, d_output, params, version, mapping, 0);
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    py::module_ np = py::module_::import("numpy");
+    auto output = np.attr("empty")(out_shape, np.attr("uint8")).cast<py::array>();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nbytes, cudaMemcpyDeviceToHost));
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
+// --- Timed variants for fp8 e5m2 ---
+py::tuple maxpool2d_timed_fp8_e5m2(
+    py::array input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, int version, int mapping)
+{
+    NVTX_RANGE_PUSH("maxpool2d_timed_fp8e5m2");
+    input = ensure_c_contiguous(input);
+    auto shape = array_shape(input);
+    size_t in_nbytes = input.size() * sizeof(__nv_fp8_e5m2);
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+    auto params = make_pool_params(shape, kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode);
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+    size_t out_nbytes = out_nelms * sizeof(__nv_fp8_e5m2);
+    { std::lock_guard<std::mutex> lock(arena_mutex); arena_in.ensure(in_nbytes); arena_out.ensure(out_nbytes); }
+    __nv_fp8_e5m2* d_input = static_cast<__nv_fp8_e5m2*>(arena_in.ptr);
+    __nv_fp8_e5m2* d_output = static_cast<__nv_fp8_e5m2*>(arena_out.ptr);
+    CUDA_CHECK(cudaMemcpy(d_input, input.data(), in_nbytes, cudaMemcpyHostToDevice));
+    float elapsed_ms = maxpool_fp8_launch_timed(d_input, d_output, params, version, mapping, 0);
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    py::module_ np = py::module_::import("numpy");
+    auto output = np.attr("empty")(out_shape, np.attr("uint8")).cast<py::array>();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nbytes, cudaMemcpyDeviceToHost));
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
+py::tuple avgpool2d_timed_fp8_e5m2(
+    py::array input,
+    const py::object& kernel_size, const py::object& stride,
+    const py::object& padding, const py::object& dilation,
+    bool ceil_mode, bool count_include_pad,
+    const py::object& divisor_override, int version, int mapping)
+{
+    NVTX_RANGE_PUSH("avgpool2d_timed_fp8e5m2");
+    input = ensure_c_contiguous(input);
+    auto shape = array_shape(input);
+    size_t in_nbytes = input.size() * sizeof(__nv_fp8_e5m2);
+    auto [kh, kw] = parse_pair(kernel_size);
+    auto [sh, sw] = stride.is_none() ? std::make_pair(kh, kw) : parse_pair(stride);
+    auto [ph, pw] = parse_pair(padding);
+    auto [dh, dw] = parse_pair(dilation);
+    int64_t div_over = divisor_override.is_none() ? 0 : divisor_override.cast<int64_t>();
+    auto params = make_avgpool_params(shape, kh, kw, sh, sw, ph, pw, dh, dw, ceil_mode, count_include_pad, div_over);
+    size_t out_nelms = static_cast<size_t>(params.N * params.OH * params.OW * params.C);
+    size_t out_nbytes = out_nelms * sizeof(__nv_fp8_e5m2);
+    { std::lock_guard<std::mutex> lock(arena_mutex); arena_in.ensure(in_nbytes); arena_out.ensure(out_nbytes); }
+    __nv_fp8_e5m2* d_input = static_cast<__nv_fp8_e5m2*>(arena_in.ptr);
+    __nv_fp8_e5m2* d_output = static_cast<__nv_fp8_e5m2*>(arena_out.ptr);
+    CUDA_CHECK(cudaMemcpy(d_input, input.data(), in_nbytes, cudaMemcpyHostToDevice));
+    float elapsed_ms = avgpool_launch_timed(d_input, d_output, params, version, mapping, 0);
+    std::vector<py::ssize_t> out_shape = {params.N, params.OH, params.OW, params.C};
+    py::module_ np = py::module_::import("numpy");
+    auto output = np.attr("empty")(out_shape, np.attr("uint8")).cast<py::array>();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(output.mutable_data(), d_output, out_nbytes, cudaMemcpyDeviceToHost));
+    NVTX_RANGE_POP();
+    return py::make_tuple(output, elapsed_ms);
+}
+
 // ---------------------------------------------------------------------------
 // PYBIND11_MODULE
 // ---------------------------------------------------------------------------
@@ -533,6 +1040,112 @@ PYBIND11_MODULE(_pooling, m) {
           py::arg("version") = 0, py::arg("mapping") = 0);
 
     m.def("avgpool2d_timed_f32", &avgpool2d_timed_f32,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = true,
+          py::arg("count_include_pad") = true, py::arg("divisor_override") = py::none(),
+          py::arg("version") = 0, py::arg("mapping") = 0);
+
+    // --- bfloat16 ---
+    m.def("maxpool2d_bf16", &maxpool2d_bf16,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = false,
+          py::arg("version") = 0, py::arg("mapping") = 0);
+    m.def("avgpool2d_bf16", &avgpool2d_bf16,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = true,
+          py::arg("count_include_pad") = true, py::arg("divisor_override") = py::none(),
+          py::arg("version") = 0, py::arg("mapping") = 0);
+
+    // --- int8 ---
+    m.def("maxpool2d_i8", &maxpool2d_i8,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = false,
+          py::arg("version") = 0, py::arg("mapping") = 0);
+    m.def("avgpool2d_i8", &avgpool2d_i8,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = true,
+          py::arg("count_include_pad") = true, py::arg("divisor_override") = py::none(),
+          py::arg("version") = 0, py::arg("mapping") = 0);
+
+    // --- int16 ---
+    m.def("maxpool2d_i16", &maxpool2d_i16,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = false,
+          py::arg("version") = 0, py::arg("mapping") = 0);
+    m.def("avgpool2d_i16", &avgpool2d_i16,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = true,
+          py::arg("count_include_pad") = true, py::arg("divisor_override") = py::none(),
+          py::arg("version") = 0, py::arg("mapping") = 0);
+
+    // --- fp8 e4m3 ---
+    m.def("maxpool2d_fp8_e4m3", &maxpool2d_fp8_e4m3,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = false,
+          py::arg("version") = 0, py::arg("mapping") = 0);
+    m.def("avgpool2d_fp8_e4m3", &avgpool2d_fp8_e4m3,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = true,
+          py::arg("count_include_pad") = true, py::arg("divisor_override") = py::none(),
+          py::arg("version") = 0, py::arg("mapping") = 0);
+
+    // --- fp8 e5m2 ---
+    m.def("maxpool2d_fp8_e5m2", &maxpool2d_fp8_e5m2,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = false,
+          py::arg("version") = 0, py::arg("mapping") = 0);
+    m.def("avgpool2d_fp8_e5m2", &avgpool2d_fp8_e5m2,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = true,
+          py::arg("count_include_pad") = true, py::arg("divisor_override") = py::none(),
+          py::arg("version") = 0, py::arg("mapping") = 0);
+
+    // --- Timed variants for all dtypes ---
+    m.def("maxpool2d_timed_bf16", &maxpool2d_timed_bf16,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = false,
+          py::arg("version") = 0, py::arg("mapping") = 0);
+    m.def("avgpool2d_timed_bf16", &avgpool2d_timed_bf16,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = true,
+          py::arg("count_include_pad") = true, py::arg("divisor_override") = py::none(),
+          py::arg("version") = 0, py::arg("mapping") = 0);
+
+    m.def("maxpool2d_timed_i8", &maxpool2d_timed_i8,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = false,
+          py::arg("version") = 0, py::arg("mapping") = 0);
+    m.def("avgpool2d_timed_i8", &avgpool2d_timed_i8,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = true,
+          py::arg("count_include_pad") = true, py::arg("divisor_override") = py::none(),
+          py::arg("version") = 0, py::arg("mapping") = 0);
+
+    m.def("maxpool2d_timed_i16", &maxpool2d_timed_i16,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = false,
+          py::arg("version") = 0, py::arg("mapping") = 0);
+    m.def("avgpool2d_timed_i16", &avgpool2d_timed_i16,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = true,
+          py::arg("count_include_pad") = true, py::arg("divisor_override") = py::none(),
+          py::arg("version") = 0, py::arg("mapping") = 0);
+
+    m.def("maxpool2d_timed_fp8_e4m3", &maxpool2d_timed_fp8_e4m3,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = false,
+          py::arg("version") = 0, py::arg("mapping") = 0);
+    m.def("avgpool2d_timed_fp8_e4m3", &avgpool2d_timed_fp8_e4m3,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = true,
+          py::arg("count_include_pad") = true, py::arg("divisor_override") = py::none(),
+          py::arg("version") = 0, py::arg("mapping") = 0);
+
+    m.def("maxpool2d_timed_fp8_e5m2", &maxpool2d_timed_fp8_e5m2,
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
+          py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = false,
+          py::arg("version") = 0, py::arg("mapping") = 0);
+    m.def("avgpool2d_timed_fp8_e5m2", &avgpool2d_timed_fp8_e5m2,
           py::arg("input"), py::arg("kernel_size"), py::arg("stride") = py::none(),
           py::arg("padding") = 0, py::arg("dilation") = 1, py::arg("ceil_mode") = true,
           py::arg("count_include_pad") = true, py::arg("divisor_override") = py::none(),
