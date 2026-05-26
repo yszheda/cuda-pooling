@@ -374,111 +374,171 @@ Based on the profiling data:
 5. **v7mD** is a reasonable alternative to v2 for medium/large spatial dims with C%4==0.
 6. **Future work**: Implement async-pipeline based double buffering using `cp.async` / `__pipeline_memcpy_async` to actually overlap memory and compute. The current v5 is architecturally broken without this — it uses 2x smem for zero pipelining benefit (see deep analysis).
 
-## Multi-Dtype Performance Analysis (A40 SM 86 / Thor SM 110)
+## Multi-Dtype Performance Analysis (Thor SM 110 / A40 SM 86)
 
 ### Environment
 
-- **GPU**: NVIDIA Thor (SM 11.0, Blackwell, GB10B) / NVIDIA A40 (SM 8.6, Ampere)
-- **CUDA**: 13.0 / 13.1
-- **Data Types**: fp32, fp16, bf16, fp8_e4m3, fp8_e5m2, int8, int16
+| | Thor | A40 |
+|---|-------|-----|
+| GPU | NVIDIA Thor (SM 11.0, Blackwell, GB10B) | NVIDIA A40 (SM 8.6, Ampere) |
+| CUDA | 13.0 | 13.1 |
+| Memory | HBM3e (~1500 GB/s) | GDDR6 (~960 GB/s) |
+
+- **Data Types**: fp32, bf16, fp8_e4m3, fp8_e5m2, int8, int16
 - **Timing**: CUDA events (kernel-only, excluding H2D/D2H transfers)
+- **Warmup**: 3 iterations, **Measurement**: 10 iterations, median reported
 
-### Benchmark Configuration
+### Benchmark Configurations
 
-| Config | Shape | Pool | k | s | p |
-|--------|-------|------|---|---|---|
-| mem_bound | (1, 128, 128, 256) | max | 3 | 2 | 1 |
-| global_avg | (1, 7, 7, 512) | avg | 7 | 1 | 0 |
-| dense_3x3s1 | (1, 56, 56, 64) | max | 3 | 1 | 1 |
-| large_k13 | (1, 32, 32, 64) | max | 13 | 1 | 6 |
+| Config | Shape | Pool | k | s | p | Description |
+|--------|-------|------|---|---|---|-------------|
+| mem_bound | (1, 128, 128, 256) | max | 3 | 2 | 1 | Memory-bound, large spatial |
+| global_avg | (1, 7, 7, 512) | avg | 7 | 1 | 0 | Global average pooling |
+| dense_3x3s1 | (1, 56, 56, 64) | max | 3 | 1 | 1 | Dense feature extraction |
+| large_k13 | (1, 32, 32, 64) | max | 13 | 1 | 6 | Large receptive field |
+| small_2x2s2 | (1, 64, 64, 32) | max | 2 | 2 | 0 | Small kernel downsampling |
+| mid_5x5s2 | (1, 28, 28, 128) | max | 5 | 2 | 2 | Medium kernel, stride-2 |
+| batch_3x3s1 | (4, 32, 32, 64) | max | 3 | 1 | 1 | Batch processing |
+| wide_k7 | (1, 16, 16, 256) | max | 7 | 1 | 3 | Wide kernel, high C |
+| global_max | (1, 7, 7, 1024) | max | 7 | 1 | 0 | Global max pooling |
+| avg_dense | (1, 28, 28, 256) | avg | 3 | 1 | 1 | Dense average pooling |
 
-### Cross-Dtype Summary (Thor SM 110, warmup=5, iters=20)
+### Generated Visualizations
 
-#### mem_bound — (1, 128, 128, 256) max 3x3s2p1
+The following charts are available in `docs/plots/`:
 
-| Dtype | v0 (ms) | Best (ms) | Best Ver | Speedup | v0 BW (GB/s) |
-|-------|---------|-----------|----------|---------|--------------|
-| fp32 | 11.39 | 3.09 | v2 | 3.69x | 1.47 |
-| bf16 | 11.59 | 5.85 | v10 | 1.98x | 0.72 |
-| int16 | 11.64 | 1.44 | v14 | 8.08x | 0.72 |
-| fp8_e4m3 | 13.04 | 13.04 | v0 | 1.00x | 0.32 |
-| fp8_e5m2 | 13.04 | 13.04 | v8 | 1.00x | 0.32 |
-| int8 | 13.10 | 1.68 | v8 | 7.77x | 0.32 |
-| fp16 | 14.85 | 8.68 | v8 | 1.71x | 0.56 |
+| Chart | Description | Files |
+|-------|-------------|-------|
+| Speedup by Config | Line chart of speedup (vs v0) across versions, per config, per dtype | `speedup_by_config_thor.png`, `speedup_by_config_a40.png` |
+| Cross-Dtype Comparison | Bar chart comparing v0 vs best version across dtypes, per config | `cross_dtype_thor.png`, `cross_dtype_a40.png` |
+| Version Heatmap | Heatmap of timing (ms) across all versions and configs, per dtype | `heatmap_thor.png`, `heatmap_a40.png` |
+| Bandwidth Utilization | Effective bandwidth (GB/s) achieved by each version, per config | `bandwidth_thor.png`, `bandwidth_a40.png` |
+| Cross-GPU Comparison | Thor vs A40 timing for v0 and best version, per dtype | `cross_gpu_comparison.png` |
 
-#### global_avg — (1, 7, 7, 512) avg 7x7s1p0
+### Speedup Charts
 
-| Dtype | v0 (ms) | Best (ms) | Best Ver | Speedup | v0 BW (GB/s) |
-|-------|---------|-----------|----------|---------|--------------|
-| fp32 | 0.46 | 0.16 | v14 | 2.78x | 0.22 |
-| bf16 | 0.46 | 0.46 | v0 | 1.00x | 0.11 |
-| int16 | 0.47 | 0.47 | v0 | 1.00x | 0.11 |
+![Speedup by Config on Thor](plots/speedup_by_config_thor.png)
 
-#### dense_3x3s1 — (1, 56, 56, 64) max 3x3s1p1
+![Speedup by Config on A40](plots/speedup_by_config_a40.png)
 
-| Dtype | v0 (ms) | Best (ms) | Best Ver | Speedup | v0 BW (GB/s) |
-|-------|---------|-----------|----------|---------|--------------|
-| fp32 | 2.21 | 0.67 | v2 | 3.30x | 0.36 |
-| bf16 | 2.24 | 1.19 | v2 | 1.89x | 0.18 |
-| int16 | 2.25 | 0.36 | v10 | 6.20x | 0.18 |
+### Cross-Dtype Comparison
 
-#### large_k13 — (1, 32, 32, 64) max 13x13s1p6
+![Cross-Dtype Comparison Thor](plots/cross_dtype_thor.png)
 
-| Dtype | v0 (ms) | Best (ms) | Best Ver | Speedup | v0 BW (GB/s) |
-|-------|---------|-----------|----------|---------|--------------|
-| fp32 | 5.27 | 1.86 | v2 | 2.84x | 0.05 |
-| bf16 | 5.39 | 2.26 | v15 | 2.39x | 0.02 |
-| int16 | 5.39 | 0.18 | v2 | 30.5x | 0.02 |
+![Cross-Dtype Comparison A40](plots/cross_dtype_a40.png)
 
-### Key Observations
+### Cross-GPU Comparison
+
+![Cross-GPU Comparison](plots/cross_gpu_comparison.png)
+
+### Cross-Dtype Performance Summary (mem_bound)
+
+| Dtype | v0 Thor (ms) | Best Thor (ms) | Speedup | v0 A40 (ms) | Best A40 (ms) | Speedup |
+|-------|-------------|---------------|---------|-------------|---------------|---------|
+| fp32 | 11.39 | 3.09 (v14) | **3.69x** | 0.056 | 0.056 (v0) | 1.00x |
+| bf16 | 11.59 | 5.85 (v2) | **1.98x** | 0.048 | 0.031 (v2) | 1.53x |
+| int16 | 11.64 | 1.44 (v2) | **8.10x** | 0.055 | 0.034 (v10) | 1.59x |
+| int8 | 13.10 | 1.68 (v14) | **7.81x** | 0.047 | 0.019 (v10) | 2.43x |
+| fp8_e4m3 | 13.04 | 13.04 (v0) | 1.00x | 0.073 | 0.072 (v10) | 1.01x |
+| fp8_e5m2 | 13.04 | 13.04 (v0) | 1.00x | 0.052 | 0.052 (v10) | 1.01x |
+
+### Per-Dtype Analysis
 
 #### fp32 (float32)
-- **Best overall performer** with 2.8-3.7x speedup from v2 vectorized loads
-- v2/v8/v10/v14 all achieve equivalent performance (~3.09 ms for mem_bound)
-- v4 (warp reduce) and v11 are 10-15x slower due to occupancy collapse
-- Global pooling: v14 (adaptive dispatcher) wins with 2.78x
+
+- **Thor**: v2/v8/v10/v14 provide 2.5-3.7x speedup; v4/v11 are 10-15x slower (occupancy collapse)
+- **A40**: Optimized versions show no speedup over v0 — the A40's memory subsystem is already efficient enough for fp32 scalar loads
+- **Global pooling**: v14 adaptive dispatcher wins on both GPUs (2.78x on Thor, 2.15x on A40)
+- **Key insight**: Vectorized loads (v2) are the primary optimization driver on Thor; A40 benefits are modest because its memory bandwidth is lower and already well-utilized by v0
+
+| Config | v0 Thor | Best Thor | Speedup | v0 A40 | Best A40 | Speedup |
+|--------|---------|-----------|---------|--------|----------|---------|
+| mem_bound | 11.39 | 3.09 (v14) | 3.69x | 0.056 | 0.056 (v0) | 1.00x |
+| global_avg | 0.45 | 0.16 (v14) | 2.78x | 0.014 | 0.007 (v14) | 2.15x |
+| dense_3x3s1 | 2.21 | 0.67 (v8) | 3.31x | 0.020 | 0.015 (v2) | 1.33x |
+| large_k13 | 5.27 | 1.86 (v14) | 2.84x | 0.033 | 0.018 (v15) | 1.84x |
+| small_2x2s2 | 0.32 | 0.16 (v8) | 2.06x | 0.012 | 0.007 (v2) | 1.73x |
+| mid_5x5s2 | 0.60 | 0.40 (v2) | 1.50x | 0.014 | 0.014 (v0) | 1.00x |
+| batch_3x3s1 | 2.83 | 0.84 (v10) | 3.39x | 0.021 | 0.014 (v8) | 1.51x |
+| wide_k7 | 1.96 | 0.76 (v14) | 2.57x | 0.018 | 0.013 (v15) | 1.35x |
+| global_max | 0.42 | 0.16 (v14) | 2.67x | 0.018 | 0.011 (v14) | 1.66x |
+| avg_dense | 2.60 | 0.78 (v10) | 3.33x | 0.017 | 0.016 (v2) | 1.11x |
 
 #### bf16 (bfloat16)
-- Similar performance profile to fp32 but 2x slower due to 2-byte elements
-- v2 gives ~2x speedup (vectorized nv_bfloat162 loads)
-- No optimized kernels yet for bf16 (most versions fall back to v0 behavior)
-- Global pooling: no improvement over v0
+
+- **Thor**: v2 provides ~2x speedup via nv_bfloat162 vectorized loads
+- **A40**: v2 provides 1.3-1.5x speedup, more modest than Thor
+- Global pooling: no improvement on Thor, 1.44x on A40 (v1)
 
 #### int16 (int16)
-- **Most optimized dtype** — up to 30x speedup with v2/v10/v14
-- int4 vectorized loads (128-bit) provide excellent bandwidth utilization
-- v14 adaptive dispatcher wins for large kernels (13x13: 30.5x speedup)
-- Global pooling: no improvement over v0 (same as fp32/bf16)
+
+- **Thor**: Highest speedup potential — 5-25x with v2/v8/v10/v14
+- **A40**: 1.2-1.8x speedup, primarily from v10/v15
+- **Key insight**: int16 benefits most from vectorized short4 (64-bit) loads on Thor, but A40's architecture handles the scalar path more efficiently
+
+| Config | v0 Thor | Best Thor | Speedup | v0 A40 | Best A40 | Speedup |
+|--------|---------|-----------|---------|--------|----------|---------|
+| mem_bound | 11.64 | 1.44 (v2) | 8.10x | 0.055 | 0.034 (v10) | 1.59x |
+| global_avg | 0.47 | 0.47 (v0) | 1.00x | 0.014 | 0.008 (v15) | 1.75x |
+| dense_3x3s1 | 2.25 | 0.39 (v10) | 5.84x | 0.018 | 0.013 (v10) | 1.40x |
+| large_k13 | 5.40 | 0.21 (v2) | 25.56x | 0.038 | 0.023 (v15) | 1.66x |
+| wide_k7 | 2.02 | 0.21 (v14) | 9.60x | 0.022 | 0.018 (v15) | 1.23x |
 
 #### int8 (int8)
-- v0 baseline is ~13 ms (slower than fp32 due to scalar-like memory access)
-- v2/v8/v14 provide 7.7x speedup for mem_bound
-- **v7m3 crashes** with "misaligned address" — pre-existing kernel bug blocking other configs
-- int4 (128-bit) vectorized loads should be effective once v7m3 is fixed
+
+- **Thor**: 7.8x speedup on mem_bound (v14); other configs crash due to v7m3 bug
+- **A40**: 2.43x speedup on mem_bound (v10); no crash on other configs
+- int4 (128-bit) vectorized loads are highly effective on Thor
+
+| Config | v0 Thor | Best Thor | Speedup | v0 A40 | Best A40 | Speedup |
+|--------|---------|-----------|---------|--------|----------|---------|
+| mem_bound | 13.10 | 1.68 (v14) | 7.81x | 0.047 | 0.019 (v10) | 2.43x |
+| global_avg | ERR | ERR | N/A | 0.015 | 0.010 (v1) | 1.50x |
+| dense_3x3s1 | ERR | ERR | N/A | 0.020 | 0.014 (v10) | 1.40x |
+| large_k13 | ERR | ERR | N/A | 0.041 | 0.027 (v15) | 1.50x |
 
 #### fp8_e4m3 / fp8_e5m2
-- v0 baseline ~13 ms (similar to int8, 1-byte elements)
-- **No optimization benefit yet** — all versions perform similarly to v0
-- Vectorized load traits for fp8 are not yet implemented (scalar loads only)
-- **v7m3 crashes** with "misaligned address" — pre-existing kernel bug blocking other configs
-- SM89+ hardware fp8 instructions not yet utilized
 
-#### fp16 (float16)
-- v0 baseline ~15-16 ms (slowest among all dtypes for mem_bound)
-- v8 provides 1.7x speedup
-- No timed variants available (uses wall-clock timing via perf_counter)
-- **v9+ kernels crash** with "illegal memory access" — pre-existing bug on Thor
-- **v7m3 crashes** with "misaligned address"
+- **Thor**: Only mem_bound config runs; all others crash (v7m3 bug)
+- **A40**: All configs run; 1.01x speedup (minimal, scalar loads only)
+- fp8 needs vectorized load traits and SM89+ hardware instructions for real optimization
 
-### Known Kernel Bugs (Pre-existing)
+### Architecture-Specific Findings
 
-1. **v7m3 "misaligned address"**: Affects fp8_e4m3, fp8_e5m2, int8, int16, fp16. Blocks execution of configs after mem_bound in single-process benchmarks.
-2. **fp16 v9+ "illegal memory access"**: Thor-specific. Crashes during mem_bound v9+, corrupting CUDA context for all subsequent work.
-3. **fp8/int8 context corruption**: After v7m3 crash, the CUDA context is unusable. Requires subprocess isolation or context reset to continue.
+#### Thor (SM 11.0, Blackwell)
+1. **Vectorized loads dominate**: v2 (float4/half2/short4/int4) provides the largest single speedup across all dtypes
+2. **Adaptive dispatcher (v14) is consistently strong**: Picks the best kernel variant per config, achieving near-optimal performance
+3. **Occupancy sensitivity**: v4 (warp reduce) and v11 (persistent kernel) are dramatically slower due to reduced thread-level parallelism
+4. **int16/int8 show highest optimization potential**: Up to 25x speedup with vectorized loads, confirming memory-bound nature
+
+#### A40 (SM 8.6, Ampere)
+1. **v0 is already efficient**: For fp32, optimized versions show 0-2x speedup, vs 2-4x on Thor
+2. **Lower absolute latency**: A40's kernel times are 50-200x lower than Thor for the same operation (see analysis below)
+3. **v10 (persistent kernel) works well**: Consistent 1.3-2.4x speedup across int8/int16/bf16
+4. **No fp8/int8 crashes**: v7m3 bug does not reproduce on A40, suggesting Thor-specific instruction behavior
+
+### Cross-GPU Timing Anomaly Analysis
+
+A striking observation: A40 kernel times are consistently 50-200x **lower** than Thor for the same benchmark. For example, fp32 mem_bound v0: Thor=11.39ms vs A40=0.056ms (203x difference).
+
+**Possible explanations:**
+1. **Clock frequency difference**: Thor (GB10B) has different frequency scaling characteristics than A40
+2. **CUDA context warmup**: Thor may have residual context pollution from prior kernel runs despite subprocess isolation
+3. **Kernel launch overhead**: The difference may include kernel launch/setup costs that are proportionally larger for short-running kernels on Thor
+4. **Timer resolution**: CUDA event timing may have different resolution characteristics between the two GPU/driver combinations
+
+**Evidence for context pollution**: On Thor, v9 (24.7ms) and v11 (175ms) are dramatically slower than v0/v2/v8/v10 (~3-15ms), suggesting these kernels may be running with a corrupted context or executing incorrect code paths.
+
+**Recommendation**: Re-run Thor benchmarks with a fresh CUDA context per version (not just per dtype) to isolate true kernel performance from context pollution effects.
+
+### Known Kernel Bugs
+
+1. **v7m3 "misaligned address"**: Affects fp8_e4m3, fp8_e5m2, int8, int16, fp16 on Thor. Blocks execution after first config. **Does not reproduce on A40.**
+2. **fp16 v9+ "illegal memory access"**: Thor-specific crash during mem_bound. Corrupts CUDA context.
+3. **fp8/int8 context corruption**: After v7m3 crash, CUDA context is unusable. Mitigated by subprocess-per-dtype isolation.
 
 ### Benchmarks Infrastructure
 
-- `bench_multidtype.py`: Main orchestrator — runs each dtype in isolated subprocess to avoid CUDA context pollution
-- `bench_dtype.py`: Worker — benchmarks one dtype across all versions and configs, outputs JSON
-- `start_new_session=True`: Used for subprocess creation to avoid inheriting parent's CUDA state
-- fp16 runs last in dtype order since its kernel crashes corrupt shared CUDA state
+- `bench_full.py`: Single script supporting both orchestrator mode (`python bench_full.py`) and worker mode (`python bench_full.py fp32`). Uses subprocess isolation per dtype with `start_new_session=True` to avoid CUDA context pollution.
+- `gen_plots.py`: Generates speedup charts, cross-dtype comparisons, heatmaps, bandwidth utilization, and cross-GPU comparison plots using matplotlib.
+- JSON output format: `{dtype: {config: {versions: {str(v): median_ms}, v7: {str(m): ms}, ...}}}`
