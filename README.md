@@ -13,10 +13,22 @@ This project implements 16 optimization stages (v0-v15) of 2D pooling kernels fo
 ## Features
 
 - **PyTorch API compatible**: Supports all MaxPool2d and AvgPool2d parameters (`kernel_size`, `stride`, `padding`, `dilation`, `ceil_mode`, `count_include_pad`, `divisor_override`)
-- **fp32 and fp16**: Native `float` and `half` computation
+- **7 data types**: fp32, fp16, bf16, fp8_e4m3, fp8_e5m2, int8, int16
 - **NHWC layout**: Input and output shape `[N, H, W, C]`
 - **16 kernel versions**: Selectable at runtime via `version` parameter
 - **v14 adaptive dispatcher**: Automatically routes to the optimal kernel based on input shape and kernel parameters
+
+## Data Types
+
+| Dtype | CUDA Type | Vec Width | Best Speedup (Thor) | Notes |
+|-------|-----------|-----------|---------------------|-------|
+| fp32 | `float` | float4 (128-bit) | 3.7x (v2) | Best overall performer |
+| fp16 | `half` | half2 (32-bit) | 1.7x (v8) | v9+ crash on Thor (pre-existing bug) |
+| bf16 | `nv_bfloat16` | nv_bfloat162 (32-bit) | 2.0x (v2) | Similar profile to fp32 |
+| fp8_e4m3 | `__nv_fp8_e4m3` | scalar (8-bit) | 1.0x | Needs SM89+ hw instructions |
+| fp8_e5m2 | `__nv_fp8_e5m2` | scalar (8-bit) | 1.0x | Needs SM89+ hw instructions |
+| int8 | `int8_t` | int4 (128-bit) | 7.8x (v14) | Highest optimization potential |
+| int16 | `int16_t` | short4 (64-bit) | 8.1x (v2) | Up to 25x on large kernels |
 
 ## Project Structure
 
@@ -90,6 +102,17 @@ output = _pooling.maxpool2d_f32(
 # MaxPool2d (fp16)
 output = _pooling.maxpool2d_f16(input, ...)  # same args, numpy float16
 
+# MaxPool2d (bf16)
+output = _pooling.maxpool2d_bf16(input, ...)  # numpy uint16 view
+
+# MaxPool2d (int8 / int16)
+output = _pooling.maxpool2d_i8(input, ...)    # numpy int8
+output = _pooling.maxpool2d_i16(input, ...)   # numpy int16
+
+# MaxPool2d (fp8 e4m3 / e5m2)
+output = _pooling.maxpool2d_fp8_e4m3(input, ...)  # numpy uint8
+output = _pooling.maxpool2d_fp8_e5m2(input, ...)  # numpy uint8
+
 # AvgPool2d (fp32)
 output = _pooling.avgpool2d_f32(
     input,              # numpy array [N, H, W, C], dtype float32
@@ -104,14 +127,22 @@ output = _pooling.avgpool2d_f32(
     mapping=0,          # int: v7 mapping variant (0-3)
 )
 
-# AvgPool2d (fp16)
-output = _pooling.avgpool2d_f16(input, ...)  # same args, numpy float16
+# AvgPool2d (fp16, bf16, int8, int16, fp8)
+output = _pooling.avgpool2d_f16(input, ...)      # numpy float16
+output = _pooling.avgpool2d_bf16(input, ...)     # numpy uint16 view
+output = _pooling.avgpool2d_i8(input, ...)       # numpy int8
+output = _pooling.avgpool2d_i16(input, ...)      # numpy int16
+output = _pooling.avgpool2d_fp8_e4m3(input, ...) # numpy uint8
+output = _pooling.avgpool2d_fp8_e5m2(input, ...) # numpy uint8
 
 # Timed variants (return (output, elapsed_ms) using CUDA events)
 output, ms = _pooling.maxpool2d_timed_f32(input, ..., version=2)
 
-# Synchronize
-_pooling.cuda_synchronize()
+# Timed variants for all dtypes
+output, ms = _pooling.maxpool2d_timed_bf16(input, ..., version=2)
+output, ms = _pooling.maxpool2d_timed_i8(input, ..., version=14)
+output, ms = _pooling.maxpool2d_timed_i16(input, ..., version=2)
+output, ms = _pooling.maxpool2d_timed_fp8_e4m3(input, ..., version=0)
 ```
 
 ## Kernel Versions
@@ -177,11 +208,20 @@ Covers ResNet, VGG, DenseNet, GoogLeNet, Inception v3/v4, YOLO SPP, ShuffleNet, 
 ### Running benchmarks
 
 ```bash
+# Full benchmark across all dtypes and versions (recommended)
+python benchmarks/bench_full.py > bench_results.json
+
+# Single dtype benchmark
+python benchmarks/bench_full.py fp32
+
 # Standard benchmarks (wall-clock time)
 python benchmarks/bench_pooling.py
 
 # CUDA event-timed benchmarks (kernel-only, excluding H2D/D2H)
 python benchmarks/bench_timed.py
+
+# Generate plots and reports from benchmark JSON
+python benchmarks/gen_plots.py docs/plots /tmp/bench_thor.json /tmp/bench_a40.json
 
 # Nsight Systems timeline profiling (requires nsys)
 python benchmarks/profile_nsys.py
@@ -204,13 +244,29 @@ pytest tests/ -v
 
 ## Performance Summary
 
-Based on comprehensive profiling on NVIDIA Thor (SM 11.0, Blackwell):
+### Thor (SM 11.0, Blackwell)
+
+Based on comprehensive profiling on NVIDIA Thor (SM 11.0, Blackwell) across 10 benchmark configurations and 6 data types:
 
 - **v2 (vectorized loads)** is the best general-purpose kernel: 2.5-3.8x over v0 for aligned channel counts
 - **v15 (swizzled shared memory)** is optimal for 3x3 stride-1 patterns, eliminating 8-way shared memory bank conflicts
 - **v4 (warp reduce)** wins only for global pooling with large kernels (7x7+): 1.6-1.9x over v0
+- **int8/int16** show the highest optimization potential: 7-25x speedup via int4/short4 vectorized loads
+- **fp8** has minimal optimization benefit yet (needs SM89+ hardware fp8 instructions)
 - Pooling is **memory-bound**: arithmetic intensity < 0.5 ops/byte for all configurations
 - The performance ceiling is DRAM bandwidth; best kernels achieve high bus utilization through coalesced 128-bit transactions
+
+### Cross-GPU Comparison
+
+| Dtype | mem_bound v0 Thor (ms) | mem_bound v0 A40 (ms) | Best Thor | Thor Speedup | Best A40 | A40 Speedup |
+|-------|----------------------|----------------------|-----------|-------------|----------|-------------|
+| fp32 | 11.39 | 0.056 | v14 | 3.69x | v0 | 1.00x |
+| bf16 | 11.59 | 0.048 | v2 | 1.98x | v2 | 1.53x |
+| int16 | 11.64 | 0.055 | v2 | 8.10x | v10 | 1.59x |
+| int8 | 13.10 | 0.047 | v14 | 7.81x | v10 | 2.43x |
+| fp8_e4m3 | 13.04 | 0.073 | v0 | 1.00x | v10 | 1.01x |
+
+See `docs/profiling_report.md` for detailed per-version analysis including per-dtype breakdowns, cross-GPU comparison charts, and quantitative analysis of kernel behavior.
 
 See `docs/profiling_report.md` for detailed per-version analysis including roofline model, stall analysis, and quantitative breakdown of why certain techniques (v5 double buffer, v6 warp specialization) underperform without async pipeline support.
 
