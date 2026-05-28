@@ -448,10 +448,11 @@ extern std::mutex v8_cache_mutex;
 extern std::unordered_map<uint64_t, TileConfig> v8_cache;
 
 // v15 swizzled shared memory kernel (used by both maxpool and avgpool)
-template <typename T, bool IS_MAXPOOL, bool COUNT_INCLUDE_PAD = true>
+template <typename T, bool IS_MAXPOOL, bool COUNT_INCLUDE_PAD>
 __global__ void maxpool_v15_kernel(
     const T* __restrict__ input, T* __restrict__ output,
-    const PoolParams params, int blocks_oh, int blocks_ow, int smem_h, int smem_w);
+    const PoolParams params, int blocks_oh, int blocks_ow, int smem_h, int smem_w,
+    int64_t divisor_override);
 
 // Utility
 PoolParams make_pool_params_from_avg(const AvgPoolParams& p);
