@@ -51,6 +51,7 @@ struct PoolParams {
     int dh, dw;
     bool ceil_mode;
     int64_t OH, OW;
+    int64_t divisor_override; // 0 means not set (used by avgpool, ignored by maxpool)
 
     void compute_output_size() {
         if (ceil_mode) {
@@ -448,7 +449,7 @@ extern std::mutex v8_cache_mutex;
 extern std::unordered_map<uint64_t, TileConfig> v8_cache;
 
 // v15 swizzled shared memory kernel (used by both maxpool and avgpool)
-template <typename T, bool IS_MAXPOOL, bool COUNT_INCLUDE_PAD>
+template <typename T, bool IS_MAXPOOL, bool COUNT_INCLUDE_PAD = true>
 __global__ void maxpool_v15_kernel(
     const T* __restrict__ input, T* __restrict__ output,
     const PoolParams params, int blocks_oh, int blocks_ow, int smem_h, int smem_w,
