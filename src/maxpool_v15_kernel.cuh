@@ -16,7 +16,8 @@ template <typename T, bool IS_MAXPOOL, bool COUNT_INCLUDE_PAD>
 __global__ void maxpool_v15_kernel(const T* __restrict__ input, T* __restrict__ output,
                                    const PoolParams params,
                                    int blocks_oh, int blocks_ow,
-                                   int smem_h, int smem_w)
+                                   int smem_h, int smem_w,
+                                   int64_t divisor_override = 0)
 {
     constexpr int TILE_OH = 8;
     constexpr int TILE_OW = 8;
@@ -108,6 +109,7 @@ __global__ void maxpool_v15_kernel(const T* __restrict__ input, T* __restrict__ 
     if constexpr (IS_MAXPOOL) {
         output[out_idx] = result_max;
     } else {
-        output[out_idx] = static_cast<T>(result_avg / count);
+        int64_t denom = (divisor_override > 0) ? divisor_override : count;
+        output[out_idx] = static_cast<T>(result_avg / denom);
     }
 }

@@ -660,7 +660,7 @@ void maxpool_v15(const nv_bfloat16* input, nv_bfloat16* output, const PoolParams
     }
 
     maxpool_v15_kernel<nv_bfloat16, true><<<grid, block, smem_bytes, stream>>>(
-        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
+        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
 }
@@ -1166,7 +1166,7 @@ void maxpool_v15(const int8_t* input, int8_t* output, const PoolParams& params, 
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
     }
     maxpool_v15_kernel<int8_t, true><<<grid, block, smem_bytes, stream>>>(
-        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
+        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
 }
@@ -1641,7 +1641,7 @@ void maxpool_v15(const int16_t* input, int16_t* output, const PoolParams& params
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
     }
     maxpool_v15_kernel<int16_t, true><<<grid, block, smem_bytes, stream>>>(
-        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
+        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
 }
@@ -1873,7 +1873,7 @@ void maxpool_v15_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, con
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
     }
     maxpool_v15_kernel<__nv_fp8_e4m3, true><<<grid, block, smem_bytes, stream>>>(
-        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
+        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
 }
@@ -2085,7 +2085,7 @@ void maxpool_v15_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, con
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
     }
     maxpool_v15_kernel<__nv_fp8_e5m2, true><<<grid, block, smem_bytes, stream>>>(
-        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
+        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
 }

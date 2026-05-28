@@ -548,11 +548,11 @@ void avgpool_v15(const nv_bfloat16* input, nv_bfloat16* output, const AvgPoolPar
     if (params.count_include_pad) {
         maxpool_v15_kernel<nv_bfloat16, false, true><<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const nv_bfloat16*>(input), reinterpret_cast<nv_bfloat16*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
+            pp, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     } else {
         maxpool_v15_kernel<nv_bfloat16, false, false><<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const nv_bfloat16*>(input), reinterpret_cast<nv_bfloat16*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
+            pp, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     }
     CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
@@ -1106,11 +1106,11 @@ void avgpool_v15(const int8_t* input, int8_t* output, const AvgPoolParams& param
     if (params.count_include_pad) {
         maxpool_v15_kernel<int8_t, false, true><<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const int8_t*>(input), reinterpret_cast<int8_t*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
+            pp, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     } else {
         maxpool_v15_kernel<int8_t, false, false><<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const int8_t*>(input), reinterpret_cast<int8_t*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
+            pp, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     }
     CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
@@ -1652,11 +1652,11 @@ void avgpool_v15(const int16_t* input, int16_t* output, const AvgPoolParams& par
     if (params.count_include_pad) {
         maxpool_v15_kernel<int16_t, false, true><<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const int16_t*>(input), reinterpret_cast<int16_t*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
+            pp, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     } else {
         maxpool_v15_kernel<int16_t, false, false><<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const int16_t*>(input), reinterpret_cast<int16_t*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
+            pp, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     }
     CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
@@ -1920,11 +1920,11 @@ void avgpool_v15(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoo
     if (params.count_include_pad) {
         maxpool_v15_kernel<__nv_fp8_e4m3, false, true><<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const __nv_fp8_e4m3*>(input), reinterpret_cast<__nv_fp8_e4m3*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
+            pp, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     } else {
         maxpool_v15_kernel<__nv_fp8_e4m3, false, false><<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const __nv_fp8_e4m3*>(input), reinterpret_cast<__nv_fp8_e4m3*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
+            pp, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     }
     CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
@@ -2188,11 +2188,11 @@ void avgpool_v15(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoo
     if (params.count_include_pad) {
         maxpool_v15_kernel<__nv_fp8_e5m2, false, true><<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const __nv_fp8_e5m2*>(input), reinterpret_cast<__nv_fp8_e5m2*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
+            pp, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     } else {
         maxpool_v15_kernel<__nv_fp8_e5m2, false, false><<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const __nv_fp8_e5m2*>(input), reinterpret_cast<__nv_fp8_e5m2*>(output),
-            pp, blocks_oh, blocks_ow, smem_h, smem_w);
+            pp, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     }
     CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();

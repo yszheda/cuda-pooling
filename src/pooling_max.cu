@@ -1818,6 +1818,16 @@ void maxpool_v10(const float* input, float* output, const PoolParams& params, cu
         maxpool_v2(input, output, params, stream);
         return;
     }
+    // Check shared memory fits within hardware limit (~164KB on most GPUs, cap at 128KB for safety)
+    constexpr int TILE_OH = 8, TILE_OW = 8;
+    const int smem_h = TILE_OH * params.sh + (params.kh - 1) * params.dh + 1;
+    const int smem_w = TILE_OW * params.sw + (params.kw - 1) * params.dw + 1;
+    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(float) + sizeof(uint32_t);
+    if (smem_bytes > 131072) {
+        NVTX_RANGE_POP();
+        maxpool_v2(input, output, params, stream);
+        return;
+    }
     maxpool_v10_launch(input, output, params, stream);
     NVTX_RANGE_POP();
 }
@@ -1826,6 +1836,15 @@ void maxpool_v10(const half* input, half* output, const PoolParams& params, cuda
     NVTX_RANGE_PUSH_C("maxpool_v10_f16", NVTX_COLOR_MAXPOOL);
     int64_t total_outputs = (int64_t)params.N * params.OH * params.OW * params.C;
     if (total_outputs > 100000) {
+        NVTX_RANGE_POP();
+        maxpool_v2(input, output, params, stream);
+        return;
+    }
+    constexpr int TILE_OH = 8, TILE_OW = 8;
+    const int smem_h = TILE_OH * params.sh + (params.kh - 1) * params.dh + 1;
+    const int smem_w = TILE_OW * params.sw + (params.kw - 1) * params.dw + 1;
+    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(half) + sizeof(uint32_t);
+    if (smem_bytes > 131072) {
         NVTX_RANGE_POP();
         maxpool_v2(input, output, params, stream);
         return;
@@ -2121,68 +2140,18 @@ static bool has_cp_async() {
 
 void maxpool_v9(const float* input, float* output, const PoolParams& params, cudaStream_t stream) {
     NVTX_RANGE_PUSH_C("maxpool_v9_f32", NVTX_COLOR_MAXPOOL);
-
-    if (!has_cp_async()) {
-        NVTX_RANGE_POP();
-        maxpool_v2(input, output, params, stream);
-        return;
-    }
-
-    constexpr int TILE_OH = 8;
-    constexpr int TILE_OW = 8;
-    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
-    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
-    const int smem_h = min((TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1,
-                           static_cast<int>(params.H + 2 * params.ph));
-    const int smem_w = min((TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1,
-                           static_cast<int>(params.W + 2 * params.pw));
-    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(float);
-
-    dim3 block(256);
-    dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
-
-    if (smem_bytes > 49152) {
-        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v9_ws_kernel<TILE_OH, TILE_OW, float>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
-    }
-
-    maxpool_v9_ws_kernel<TILE_OH, TILE_OW, float><<<grid, block, smem_bytes, stream>>>(
-        input, output, params, blocks_oh, blocks_ow);
-    CUDA_CHECK(cudaGetLastError());
+    // v9 warp-specialized async pipeline is buggy on SM 110 (Blackwell)
+    // and never outperformed v2 in benchmarks. Always fall back.
     NVTX_RANGE_POP();
+    maxpool_v2(input, output, params, stream);
 }
 
 void maxpool_v9(const half* input, half* output, const PoolParams& params, cudaStream_t stream) {
     NVTX_RANGE_PUSH_C("maxpool_v9_f16", NVTX_COLOR_MAXPOOL);
-
-    if (!has_cp_async()) {
-        NVTX_RANGE_POP();
-        maxpool_v2(input, output, params, stream);
-        return;
-    }
-
-    constexpr int TILE_OH = 8;
-    constexpr int TILE_OW = 8;
-    const int blocks_oh = static_cast<int>((params.OH + TILE_OH - 1) / TILE_OH);
-    const int blocks_ow = static_cast<int>((params.OW + TILE_OW - 1) / TILE_OW);
-    const int smem_h = min((TILE_OH - 1) * params.sh + (params.kh - 1) * params.dh + 1,
-                           static_cast<int>(params.H + 2 * params.ph));
-    const int smem_w = min((TILE_OW - 1) * params.sw + (params.kw - 1) * params.dw + 1,
-                           static_cast<int>(params.W + 2 * params.pw));
-    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(half);
-
-    dim3 block(256);
-    dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
-
-    if (smem_bytes > 49152) {
-        CUDA_CHECK(cudaFuncSetAttribute(maxpool_v9_ws_kernel<TILE_OH, TILE_OW, half>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
-    }
-
-    maxpool_v9_ws_kernel<TILE_OH, TILE_OW, half><<<grid, block, smem_bytes, stream>>>(
-        input, output, params, blocks_oh, blocks_ow);
-    CUDA_CHECK(cudaGetLastError());
+    // v9 warp-specialized async pipeline is buggy on SM 110 (Blackwell)
+    // and never outperformed v2 in benchmarks. Always fall back.
     NVTX_RANGE_POP();
+    maxpool_v2(input, output, params, stream);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -2304,12 +2273,31 @@ static void maxpool_v12_launch(const T* d_input, T* d_output, const PoolParams& 
 
 void maxpool_v12(const float* input, float* output, const PoolParams& params, cudaStream_t stream) {
     NVTX_RANGE_PUSH_C("maxpool_v12_f32", NVTX_COLOR_MAXPOOL);
+    // Check shared memory fits within hardware limit
+    constexpr int TILE_OH = 16, TILE_OW = 16;
+    const int smem_h = TILE_OH * params.sh + (params.kh - 1) * params.dh + 1;
+    const int smem_w = TILE_OW * params.sw + (params.kw - 1) * params.dw + 1;
+    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(float);
+    if (smem_bytes > 131072) {
+        NVTX_RANGE_POP();
+        maxpool_v2(input, output, params, stream);
+        return;
+    }
     maxpool_v12_launch(input, output, params, stream);
     NVTX_RANGE_POP();
 }
 
 void maxpool_v12(const half* input, half* output, const PoolParams& params, cudaStream_t stream) {
     NVTX_RANGE_PUSH_C("maxpool_v12_f16", NVTX_COLOR_MAXPOOL);
+    constexpr int TILE_OH = 16, TILE_OW = 16;
+    const int smem_h = TILE_OH * params.sh + (params.kh - 1) * params.dh + 1;
+    const int smem_w = TILE_OW * params.sw + (params.kw - 1) * params.dw + 1;
+    size_t smem_bytes = static_cast<size_t>(smem_h) * smem_w * sizeof(half);
+    if (smem_bytes > 131072) {
+        NVTX_RANGE_POP();
+        maxpool_v2(input, output, params, stream);
+        return;
+    }
     maxpool_v12_launch(input, output, params, stream);
     NVTX_RANGE_POP();
 }
@@ -2554,6 +2542,13 @@ void maxpool_v15(const float* input, float* output, const PoolParams& params, cu
     // +1 column padding to break bank conflicts
     size_t smem_bytes = static_cast<size_t>(smem_h) * (smem_w + 1) * sizeof(float);
 
+    // Fall back to v2 if shared memory exceeds hardware limit
+    if (smem_bytes > 131072) {
+        NVTX_RANGE_POP();
+        maxpool_v2(input, output, params, stream);
+        return;
+    }
+
     dim3 block(TILE_OW, TILE_OH);
     dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
 
@@ -2563,7 +2558,7 @@ void maxpool_v15(const float* input, float* output, const PoolParams& params, cu
     }
 
     maxpool_v15_kernel<float, true><<<grid, block, smem_bytes, stream>>>(
-        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
+        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
 }
@@ -2582,6 +2577,13 @@ void maxpool_v15(const half* input, half* output, const PoolParams& params, cuda
     // +1 column padding to break bank conflicts
     size_t smem_bytes = static_cast<size_t>(smem_h) * (smem_w + 1) * sizeof(half);
 
+    // Fall back to v2 if shared memory exceeds hardware limit
+    if (smem_bytes > 131072) {
+        NVTX_RANGE_POP();
+        maxpool_v2(input, output, params, stream);
+        return;
+    }
+
     dim3 block(TILE_OW, TILE_OH);
     dim3 grid(blocks_oh * blocks_ow, static_cast<int>(params.C), static_cast<int>(params.N));
 
@@ -2591,7 +2593,7 @@ void maxpool_v15(const half* input, half* output, const PoolParams& params, cuda
     }
 
     maxpool_v15_kernel<half, true><<<grid, block, smem_bytes, stream>>>(
-        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w);
+        input, output, params, blocks_oh, blocks_ow, smem_h, smem_w, params.divisor_override);
     CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
 }
