@@ -18,12 +18,24 @@ def _rand_nhwc(N, H, W, C, dtype=np.float32):
 
 # ---------- basic kernel_size, stride, padding combos ----------
 
+def _basic_combos():
+    """Generate (kernel_size, stride, padding) combos, excluding PyTorch-invalid ones.
+
+    PyTorch requires padding <= kernel_size / 2, so kernel_size=1 cannot have padding > 0.
+    """
+    kernel_sizes = [1, 2, 3, 5, 7, (3, 2), (2, 3)]
+    stride_padding = [(1, 0), (2, 0), (2, 1), (3, 1)]
+    combos = []
+    for ks, (s, p) in __import__("itertools").product(kernel_sizes, stride_padding):
+        ks_tuple = ks if isinstance(ks, tuple) else (ks, ks)
+        if p > min(ks_tuple) // 2:
+            continue
+        combos.append((ks, s, p))
+    return combos
+
 @pytest.mark.parametrize("version", MAXPOOL_VERSIONS)
 @pytest.mark.parametrize("dtype", [np.float32, np.float16])
-@pytest.mark.parametrize("kernel_size", [1, 2, 3, 5, 7, (3, 2), (2, 3)])
-@pytest.mark.parametrize("stride,padding", [
-    (1, 0), (2, 0), (2, 1), (3, 1),
-])
+@pytest.mark.parametrize("kernel_size,stride,padding", _basic_combos())
 def test_basic(version, dtype, kernel_size, stride, padding):
     x = _rand_nhwc(2, 32, 32, 4, dtype)
     expected = pytorch_maxpool2d(x, kernel_size, stride, padding, 1, False)
