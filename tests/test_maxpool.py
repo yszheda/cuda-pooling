@@ -145,9 +145,9 @@ def test_nonsquare_params(version, dtype):
 @pytest.mark.parametrize("dtype", [np.float32, np.float16])
 def test_dilation_with_padding(version, dtype):
     x = _rand_nhwc(2, 16, 16, 4, dtype)
-    # dilation=2, kernel=3: max padding = 2*(3-1)/2 = 2, so p=2 is valid
-    expected = pytorch_maxpool2d(x, 3, 2, 2, 2, False)
-    actual = call_maxpool2d(x, 3, 2, 2, 2, False, version)
+    # dilation=2, kernel=3: max padding = kernel_size/2 = 1, so p=1 is valid
+    expected = pytorch_maxpool2d(x, 3, 2, 1, 2, False)
+    actual = call_maxpool2d(x, 3, 2, 1, 2, False, version)
     check_close(actual, expected, dtype)
 
 
