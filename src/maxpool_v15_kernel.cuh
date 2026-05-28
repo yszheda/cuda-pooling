@@ -17,7 +17,7 @@ __global__ void maxpool_v15_kernel(const T* __restrict__ input, T* __restrict__ 
                                    const PoolParams params,
                                    int blocks_oh, int blocks_ow,
                                    int smem_h, int smem_w,
-                                   int64_t divisor_override = 0)
+                                   int64_t divisor_override)
 {
     constexpr int TILE_OH = 8;
     constexpr int TILE_OW = 8;
