@@ -18,6 +18,11 @@ The CUDA pooling project has reached production stability with all 4044 unit tes
 3. **v15 (Full Parameter Support)** adds divisor_override and COUNT_INCLUDE_PAD support with near-zero overhead for most configurations (within 1.0x-1.3x of v14)
 4. **v4 (Warp Reduce)** remains counterproductive for standard workloads (5-14x slower) but still wins for global pooling with very high karea
 
+**fp8 vectorized loads (new):**
+- fp8_e4m3/e5m2 now use `uint4` (128-bit) loads for 16 elements per thread
+- **5.3-5.9x speedup** for fp8 mem_bound configs (previously 1.0x with scalar fallback)
+- Same approach applied to avgpool
+
 **Key stability fixes since v1 report:**
 - v7mD misaligned address bug fixed: int8/int16/fp8 now fall back to v0 safely
 - v15 divisor_override support added and validated
@@ -382,3 +387,40 @@ Our best kernel (v2) achieves ~3.1 ms for this size, indicating ~0.3% bandwidth 
 - `gen_plots.py`: Generates speedup charts, cross-dtype comparisons, heatmaps, bandwidth utilization, and cross-GPU comparison plots using matplotlib.
 - JSON output: `benchmarks/bench_thor.json` (Thor), `benchmarks/bench_a40.json` (A40)
 - JSON format: `{dtype: {config: {versions: {str(v): median_ms}, v7: {str(m): ms}, ...}}}`
+
+## fp8 Vectorized Loads (New)
+
+### Background
+
+fp8 (e4m3, e5m2) had **zero speedup** from v2 because the v2 kernel fell back to scalar loads — there are no native `float4`-equivalent vector types for 1-byte fp8. The `maxpool_v2_fp8_kernel` template used `if constexpr (std::is_same_v<T, float>)` for float4 and an `else` branch with `half2` loads, which was only correct for `half` and `nv_bfloat16`.
+
+### Implementation
+
+New `maxpool_v2_fp8_kernel<T>` template uses `uint4` (128-bit) loads to process **16 fp8 elements per thread**:
+
+```cpp
+// Load 16 fp8 values as a single 128-bit transaction
+uint4 vec = *reinterpret_cast<const uint4*>(&input[in_idx]);
+const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&vec);
+// Process each fp8 element in the vectorized load
+for (int v = 0; v < 16; ++v) {
+    T val;
+    reinterpret_cast<uint8_t*>(&val)[0] = bytes[v];
+    float fval = static_cast<float>(val);
+    if (fval > maxval[v]) maxval[v] = fval;
+}
+```
+
+### Performance
+
+| Dtype | Config | v0 (ms) | v2 (ms) | Speedup |
+|-------|--------|---------|---------|---------|
+| fp8_e4m3 | mem_bound (1,128,128,256) | 326 | 55 | **5.9x** |
+| fp8_e5m2 | mem_bound (1,128,128,256) | 301 | 57 | **5.3x** |
+
+**Key insight**: fp8 benefits from 128-bit vectorized loads just like fp32 benefits from float4. The 16x reduction in memory transactions provides a proportional speedup, confirming that pooling is memory-bound across all data types.
+
+### Same Approach Applied to AvgPool
+
+The `avgpool_v2_fp8_kernel` template uses the same `uint4` load pattern with float accumulation for correct averaging. Both e4m3 and e5m2 are supported.
+
