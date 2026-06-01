@@ -1894,6 +1894,8 @@ void maxpool_v14_fp8_e4m3(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, con
     int64_t total_output_elems = params.N * params.OH * params.OW * params.C;
     if (total_output_elems < 65536) { maxpool_v10_fp8_e4m3(input, output, params, stream); NVTX_RANGE_POP(); return; }
     if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3) { maxpool_v15_fp8_e4m3(input, output, params, stream); NVTX_RANGE_POP(); return; }
+    // Now v2 has uint4 vectorized loads — use it for fp8 too
+    if (params.C % 16 == 0) { maxpool_v2_fp8_e4m3(input, output, params, stream); NVTX_RANGE_POP(); return; }
     maxpool_v0_fp8_e4m3(input, output, params, stream);
     NVTX_RANGE_POP();
 }
@@ -2108,6 +2110,8 @@ void maxpool_v14_fp8_e5m2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, con
     int64_t total_output_elems = params.N * params.OH * params.OW * params.C;
     if (total_output_elems < 65536) { maxpool_v10_fp8_e5m2(input, output, params, stream); NVTX_RANGE_POP(); return; }
     if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3) { maxpool_v15_fp8_e5m2(input, output, params, stream); NVTX_RANGE_POP(); return; }
+    // Now v2 has uint4 vectorized loads — use it for fp8 too
+    if (params.C % 16 == 0) { maxpool_v2_fp8_e5m2(input, output, params, stream); NVTX_RANGE_POP(); return; }
     maxpool_v0_fp8_e5m2(input, output, params, stream);
     NVTX_RANGE_POP();
 }

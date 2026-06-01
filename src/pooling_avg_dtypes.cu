@@ -1948,6 +1948,7 @@ void avgpool_v14(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoo
     int64_t total_output_elems = params.N * params.OH * params.OW * params.C;
     if (total_output_elems < 65536) { avgpool_v10(input, output, params, stream); NVTX_RANGE_POP(); return; }
     if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3) { avgpool_v15(input, output, params, stream); NVTX_RANGE_POP(); return; }
+    if (params.C % 16 == 0) { avgpool_v2(input, output, params, stream); NVTX_RANGE_POP(); return; }
     avgpool_v0(input, output, params, stream);
     NVTX_RANGE_POP();
 }
@@ -2217,6 +2218,7 @@ void avgpool_v14(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoo
     int64_t total_output_elems = params.N * params.OH * params.OW * params.C;
     if (total_output_elems < 65536) { avgpool_v10(input, output, params, stream); NVTX_RANGE_POP(); return; }
     if (params.sh == 1 && params.sw == 1 && params.kh == 3 && params.kw == 3) { avgpool_v15(input, output, params, stream); NVTX_RANGE_POP(); return; }
+    if (params.C % 16 == 0) { avgpool_v2(input, output, params, stream); NVTX_RANGE_POP(); return; }
     avgpool_v0(input, output, params, stream);
     NVTX_RANGE_POP();
 }
