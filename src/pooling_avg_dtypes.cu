@@ -1025,14 +1025,8 @@ void avgpool_v7(const int8_t* input, int8_t* output, const AvgPoolParams& params
             CUDA_CHECK(cudaGetLastError()); break;
         }
         case 3: {
-            if (params.C % 4 != 0) { NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return; }
-            const int C_groups = static_cast<int>((params.C + 31) / 32);
-            const int64_t grid_z_64 = params.N * C_groups;
-            if (grid_z_64 > 65535) { NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return; }
-            dim3 block(32, 8, 1);
-            dim3 grid(static_cast<int>((params.OW + 3) / 4), static_cast<int>((params.OH + 3) / 4), static_cast<int>(grid_z_64));
-            avgpool_v7_mappingD_kernel<int8_t><<<grid, block, 0, stream>>>(input, output, params, C_groups);
-            CUDA_CHECK(cudaGetLastError()); break;
+            // v7mD uses half2 vectorized loads — misaligned for 1-byte int8_t
+            NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return;
         }
         default:
             NVTX_RANGE_POP();
@@ -1571,14 +1565,8 @@ void avgpool_v7(const int16_t* input, int16_t* output, const AvgPoolParams& para
             CUDA_CHECK(cudaGetLastError()); break;
         }
         case 3: {
-            if (params.C % 4 != 0) { NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return; }
-            const int C_groups = static_cast<int>((params.C + 31) / 32);
-            const int64_t grid_z_64 = params.N * C_groups;
-            if (grid_z_64 > 65535) { NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return; }
-            dim3 block(32, 8, 1);
-            dim3 grid(static_cast<int>((params.OW + 3) / 4), static_cast<int>((params.OH + 3) / 4), static_cast<int>(grid_z_64));
-            avgpool_v7_mappingD_kernel<int16_t><<<grid, block, 0, stream>>>(input, output, params, C_groups);
-            CUDA_CHECK(cudaGetLastError()); break;
+            // v7mD uses half2 vectorized loads — misaligned for 2-byte int16_t
+            NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return;
         }
         default:
             NVTX_RANGE_POP();
@@ -1839,14 +1827,8 @@ void avgpool_v7(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPool
             CUDA_CHECK(cudaGetLastError()); break;
         }
         case 3: {
-            if (params.C % 4 != 0) { NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return; }
-            const int C_groups = static_cast<int>((params.C + 31) / 32);
-            const int64_t grid_z_64 = params.N * C_groups;
-            if (grid_z_64 > 65535) { NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return; }
-            dim3 block(32, 8, 1);
-            dim3 grid(static_cast<int>((params.OW + 3) / 4), static_cast<int>((params.OH + 3) / 4), static_cast<int>(grid_z_64));
-            avgpool_v7_mappingD_kernel<__nv_fp8_e4m3><<<grid, block, 0, stream>>>(input, output, params, C_groups);
-            CUDA_CHECK(cudaGetLastError()); break;
+            // v7mD uses half2 vectorized loads — misaligned for 1-byte fp8
+            NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return;
         }
         default:
             NVTX_RANGE_POP();
@@ -2107,14 +2089,8 @@ void avgpool_v7(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPool
             CUDA_CHECK(cudaGetLastError()); break;
         }
         case 3: {
-            if (params.C % 4 != 0) { NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return; }
-            const int C_groups = static_cast<int>((params.C + 31) / 32);
-            const int64_t grid_z_64 = params.N * C_groups;
-            if (grid_z_64 > 65535) { NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return; }
-            dim3 block(32, 8, 1);
-            dim3 grid(static_cast<int>((params.OW + 3) / 4), static_cast<int>((params.OH + 3) / 4), static_cast<int>(grid_z_64));
-            avgpool_v7_mappingD_kernel<__nv_fp8_e5m2><<<grid, block, 0, stream>>>(input, output, params, C_groups);
-            CUDA_CHECK(cudaGetLastError()); break;
+            // v7mD uses half2 vectorized loads — misaligned for 1-byte fp8
+            NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return;
         }
         default:
             NVTX_RANGE_POP();
