@@ -1755,10 +1755,81 @@ void avgpool_v1(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPool
     NVTX_RANGE_POP();
 }
 
+// --- v2: fp8 vectorized loads using uint4 (128-bit, 16 fp8 elements) ---
+template <typename T>
+__global__ void avgpool_v2_fp8_kernel(
+    const T* __restrict__ input, T* __restrict__ output, const AvgPoolParams params)
+{
+    constexpr int VEC = 16;
+    const int64_t n = blockIdx.z;
+    const int64_t C_vec = params.C / VEC;
+    const int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t total = params.OH * params.OW * C_vec;
+    if (n >= params.N || flat >= total) return;
+
+    const int64_t oh = flat / (params.OW * C_vec);
+    const int64_t ow = (flat / C_vec) % params.OW;
+    const int64_t c_vec = flat % C_vec;
+    const int64_t c = c_vec * VEC;
+
+    float sumval[VEC];
+    int count[VEC];
+    #pragma unroll
+    for (int v = 0; v < VEC; ++v) {
+        sumval[v] = 0.0f;
+        count[v] = 0;
+    }
+
+    for (int kh_i = 0; kh_i < params.kh; ++kh_i) {
+        const int64_t ih = oh * params.sh - params.ph + static_cast<int64_t>(kh_i) * params.dh;
+        const bool ih_valid = (ih >= 0 && ih < params.H);
+        for (int kw_i = 0; kw_i < params.kw; ++kw_i) {
+            const int64_t iw = ow * params.sw - params.pw + static_cast<int64_t>(kw_i) * params.dw;
+            const bool iw_valid = (iw >= 0 && iw < params.W);
+            if (!ih_valid || !iw_valid) {
+                if (params.count_include_pad) {
+                    #pragma unroll
+                    for (int v = 0; v < VEC; ++v) count[v]++;
+                }
+                continue;
+            }
+            const int64_t in_idx = ((n * params.H + ih) * params.W + iw) * params.C + c;
+            uint4 vec = *reinterpret_cast<const uint4*>(&input[in_idx]);
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&vec);
+            #pragma unroll
+            for (int v = 0; v < VEC; ++v) {
+                T val;
+                reinterpret_cast<uint8_t*>(&val)[0] = bytes[v];
+                sumval[v] += static_cast<float>(val);
+                count[v]++;
+            }
+        }
+    }
+
+    const int64_t out_idx = ((n * params.OH + oh) * params.OW + ow) * params.C + c;
+    int64_t denom = (params.divisor_override > 0) ? params.divisor_override : 1;
+    uint4 out_vec;
+    #pragma unroll
+    for (int v = 0; v < VEC; ++v) {
+        int64_t d = (params.divisor_override > 0) ? params.divisor_override : count[v];
+        if (d == 0) d = 1;
+        T val = static_cast<T>(sumval[v] / d);
+        reinterpret_cast<uint8_t*>(&out_vec)[v] = reinterpret_cast<uint8_t*>(&val)[0];
+    }
+    *reinterpret_cast<uint4*>(&output[out_idx]) = out_vec;
+}
+
 // --- v2: scalar loads (no native fp8 vectorization) ---
 void avgpool_v2(const __nv_fp8_e4m3* input, __nv_fp8_e4m3* output, const AvgPoolParams& params, cudaStream_t stream) {
     NVTX_RANGE_PUSH_C("avgpool_v2_fp8e4m3", NVTX_COLOR_AVGPOOL);
-    avgpool_v0(input, output, params, stream);
+    if (params.C % 16 != 0) { NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return; }
+    const int threads = 256;
+    const int64_t C_vec = params.C / 16;
+    const int64_t total = params.OH * params.OW * C_vec;
+    const int blocks_x = static_cast<int>((total + threads - 1) / threads);
+    dim3 grid(blocks_x, 1, static_cast<int>(params.N));
+    avgpool_v2_fp8_kernel<__nv_fp8_e4m3><<<grid, threads, 0, stream>>>(input, output, params);
+    CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
 }
 
@@ -2017,10 +2088,17 @@ void avgpool_v1(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPool
     NVTX_RANGE_POP();
 }
 
-// --- v2: scalar loads (no native fp8 vectorization) ---
+// --- v2: fp8 vectorized loads (same kernel template as e4m3) ---
 void avgpool_v2(const __nv_fp8_e5m2* input, __nv_fp8_e5m2* output, const AvgPoolParams& params, cudaStream_t stream) {
     NVTX_RANGE_PUSH_C("avgpool_v2_fp8e5m2", NVTX_COLOR_AVGPOOL);
-    avgpool_v0(input, output, params, stream);
+    if (params.C % 16 != 0) { NVTX_RANGE_POP(); avgpool_v0(input, output, params, stream); return; }
+    const int threads = 256;
+    const int64_t C_vec = params.C / 16;
+    const int64_t total = params.OH * params.OW * C_vec;
+    const int blocks_x = static_cast<int>((total + threads - 1) / threads);
+    dim3 grid(blocks_x, 1, static_cast<int>(params.N));
+    avgpool_v2_fp8_kernel<__nv_fp8_e5m2><<<grid, threads, 0, stream>>>(input, output, params);
+    CUDA_CHECK(cudaGetLastError());
     NVTX_RANGE_POP();
 }
 
