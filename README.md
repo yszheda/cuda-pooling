@@ -8,7 +8,7 @@ This project implements 16 optimization stages (v0-v15) of 2D pooling kernels fo
 
 **Target hardware**: NVIDIA Thor (SM 11.0, Blackwell), CUDA 13.0. Multi-architecture builds support SM 80-110.
 
-**Best result**: v2 (vectorized loads) achieves **2.5-3.8x** speedup over the naive baseline across all benchmark configurations. v15 (swizzled shared memory) is the fastest for 3x3 stride-1 patterns.
+**Best result**: v2 (vectorized loads) achieves **2.5-3.8x** speedup over the naive baseline for fp32, **5-12x** for fp8 via uint4 (128-bit) vectorized loads, and up to **25x** for int16 on large kernels. v15 (swizzled shared memory) excels for 3x3 stride-1 patterns.
 
 ## Features
 
@@ -23,10 +23,10 @@ This project implements 16 optimization stages (v0-v15) of 2D pooling kernels fo
 | Dtype | CUDA Type | Vec Width | Best Speedup (Thor) | Notes |
 |-------|-----------|-----------|---------------------|-------|
 | fp32 | `float` | float4 (128-bit) | 3.7x (v2) | Best overall performer |
-| fp16 | `half` | half2 (32-bit) | 1.7x (v8) | v9+ crash on Thor (pre-existing bug) |
+| fp16 | `half` | half2 (32-bit) | 1.7x (v8) | v9 buggy on SM 110 → falls back to v2 |
 | bf16 | `nv_bfloat16` | nv_bfloat162 (32-bit) | 2.0x (v2) | Similar profile to fp32 |
-| fp8_e4m3 | `__nv_fp8_e4m3` | scalar (8-bit) | 1.0x | Needs SM89+ hw instructions |
-| fp8_e5m2 | `__nv_fp8_e5m2` | scalar (8-bit) | 1.0x | Needs SM89+ hw instructions |
+| fp8_e4m3 | `__nv_fp8_e4m3` | uint4 (128-bit) | 5.9x (v2) | 16 elements per thread via uint4 loads |
+| fp8_e5m2 | `__nv_fp8_e5m2` | uint4 (128-bit) | 5.3x (v2) | 16 elements per thread via uint4 loads |
 | int8 | `int8_t` | int4 (128-bit) | 7.8x (v14) | Highest optimization potential |
 | int16 | `int16_t` | short4 (64-bit) | 8.1x (v2) | Up to 25x on large kernels |
 
